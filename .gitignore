@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch Checkpoints and Models
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Media and Datasets
+/data/
+*.mkv
+*.mp4
+*.wav
+*.flac
+*.npy
+*.npz
+
+# Logs, Debugs, and Temporary Texts
+*.log
+shape_debug_*.txt
+broken_wav_games.txt
+missing_audio_games.txt
+need_720p_games.txt
+
+# Virtual Environments
+venv/
+env/
+.env
+.venv
+conda-env/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
