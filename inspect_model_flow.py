@@ -227,7 +227,7 @@ def main():
     parser.add_argument("--no_llm",          action="store_true",
                         help="跳过Qwen LLM加载，只分析Encoder")
     parser.add_argument("--log_file",        type=str, default=None,
-                        help="同时写入到文件（如 model_flow.txt）")
+                        help="同时写入到文件（如 docs/model_flow.txt）")
     args = parser.parse_args()
 
     # ── 可选：同时写文件 ──────────────────────────────────────

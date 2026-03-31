@@ -54,12 +54,15 @@ The repository itself does not bundle datasets or checkpoints. A typical local s
 ```text
 workspace/
 ├── dual-stream-qwen-captioning/
+│   ├── configs/
+│   │   └── ds_a6000_bf16.json
 │   ├── deployment/api.py
+│   ├── tools/
+│   │   └── run_audio_fix.sh
 │   ├── dual_qformer.py
 │   ├── dataset_dual.py
 │   ├── run_train.sh
 │   ├── run_test.sh
-│   ├── run_audio_fix.sh
 │   └── env.example
 ├── caption-2024/
 │   └── <league>/<season>/<match>/

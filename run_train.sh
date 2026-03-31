@@ -229,10 +229,10 @@ NUM_GPUS=2
 GPU_TYPE="A6000"
 
 if [ "$GPU_TYPE" == "V100" ]; then
-    DS_CONFIG="ds_v100_fp16.json"
+    DS_CONFIG="configs/ds_v100_fp16.json"
     echo "⚡ 检测到 V100，使用 ZeRO-2 FP16 模式..."
 else
-    DS_CONFIG="ds_a6000_bf16.json"
+    DS_CONFIG="configs/ds_a6000_bf16.json"
     echo "🔥 检测到 A6000，开启 BF16 满血模式..."
 fi
 
