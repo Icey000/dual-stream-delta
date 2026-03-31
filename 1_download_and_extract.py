@@ -7,12 +7,14 @@ import SoccerNet.Downloader
 import SoccerNet.utils
 
 # ================= 配置区 =================
-ROOT_DIR = os.environ.get("SOCCERNET_ROOT", "./data/SoccerNet")
+ROOT_DIR = os.getenv("SOCCERNET_AUDIO_ROOT", "/path/to/SoccerNet-audio")
 PASSWORD = "s0cc3rn3t"
 SPLITS = ["train", "valid", "test"]
 # ==========================================
 
 parser = argparse.ArgumentParser()
+parser.add_argument("--root_dir", type=str, default=ROOT_DIR,
+                    help="SoccerNet audio root containing downloaded MKV/WAV files")
 parser.add_argument("--from_txt", type=str, default=None,
                     help="只处理此 txt 文件中列出的比赛（每行一个相对路径），"
                          "通常是 missing_audio_games.txt 或 broken_wav_games.txt")
@@ -72,12 +74,14 @@ def extract_audio_from_mkv(mkv_path, wav_path):
 #  主逻辑
 # ══════════════════════════════════════════════════════
 
+root_dir = args.root_dir.rstrip("/")
+
 print(f"\n{'='*65}")
 print(f"  STEP 1+2: 下载 {args.quality} MKV + 提取 WAV 音频")
-print(f"  ROOT_DIR: {ROOT_DIR}")
+print(f"  ROOT_DIR: {root_dir}")
 print(f"{'='*65}\n")
 
-my_downloader = SoccerNetDownloader(LocalDirectory=ROOT_DIR)
+my_downloader = SoccerNetDownloader(LocalDirectory=root_dir)
 my_downloader.password = PASSWORD
 original_getListGames = SoccerNet.utils.getListGames
 
@@ -129,7 +133,7 @@ for split in SPLITS:
     print(f"\n>>> 扫描硬盘状态...")
     games_to_download = []
     for game in all_games:
-        game_path = os.path.join(ROOT_DIR, game)
+        game_path = os.path.join(root_dir, game)
         need_dl = False
         for half in [1, 2]:
             mkv_path = os.path.join(game_path, f"{half}_{args.quality}.mkv")
@@ -179,7 +183,7 @@ for split in SPLITS:
     # ── STEP 3：逐场逐半场提取 WAV ────────────────────
     print(f"\n>>> 开始 ffmpeg 提取音频...")
     for i, game in enumerate(all_games):
-        game_path = os.path.join(ROOT_DIR, game)
+        game_path = os.path.join(root_dir, game)
         os.makedirs(game_path, exist_ok=True)
         total_games_processed += 1
 

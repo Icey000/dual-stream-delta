@@ -5,7 +5,7 @@ dataset_dual.py - 双模态数据集 (Video + Audio)
 - SoccerNetCaptionsDual: Captioning 训练/验证数据集
 - SoccerNetClipsDual: Spotting 训练数据集 (clip 级别)
 - SoccerNetClipsTestingDual: Spotting 推理数据集 (整场比赛)
-- collate_fn_gpt_dual: 双模态 GPT collate 函数
+- CollateGPTDual: 双模态 GPT collate 函数
 
 核心特性:
     1. 支持双根目录 (vision_root / audio_root)
@@ -24,15 +24,123 @@ from torch.utils.data.dataloader import default_collate
 
 from SoccerNet.Downloader import getListGames
 from SoccerNet.Evaluation.utils import getMetaDataTask
-import tiktoken
-
 # 从原有 dataset.py 复用常量和处理器
 from dataset import (
     PAD_TOKEN, SOS_TOKEN, EOS_TOKEN,
     feats2clip,
     SoccerNetVideoProcessor,
-    TikTokenTextProcessor,
+    HFTextProcessor,
+    CollateGPT,
+    _compute_normalized_center_offset,
+    _init_center_regression_targets,
 )
+
+
+def _init_spotting_targets(num_clips, num_classes):
+    targets = np.zeros((num_clips, num_classes + 1), dtype=np.float32)
+    targets[:, 0] = 1.0
+    return targets
+
+
+def _set_hard_spotting_target(targets, clip_index, class_index):
+    if clip_index < 0 or clip_index >= targets.shape[0]:
+        return
+    targets[clip_index, :] = 0.0
+    targets[clip_index, class_index + 1] = 1.0
+
+
+def _set_soft_spotting_targets(targets, center_clip, class_index, radius=2, sigma=1.0):
+    if center_clip < 0 or center_clip >= targets.shape[0]:
+        return
+
+    radius = max(0, int(radius))
+    sigma = float(sigma)
+    if sigma <= 0:
+        sigma = 1.0
+
+    for delta in range(-radius, radius + 1):
+        clip_index = center_clip + delta
+        if clip_index < 0 or clip_index >= targets.shape[0]:
+            continue
+
+        event_prob = float(np.exp(-((delta ** 2) / (2.0 * sigma * sigma))))
+        event_prob = min(max(event_prob, 0.0), 1.0)
+        existing_event_prob = float(targets[clip_index, 1:].max()) if targets.shape[1] > 1 else 0.0
+        if event_prob < existing_event_prob:
+            continue
+
+        targets[clip_index, :] = 0.0
+        targets[clip_index, 0] = 1.0 - event_prob
+        targets[clip_index, class_index + 1] = event_prob
+
+
+def _build_spotting_targets(
+    num_clips,
+    num_classes,
+    annotations,
+    dict_event,
+    framerate,
+    window_size_frame,
+    target_mode="hard_multiclass",
+    soft_window_radius=2,
+    soft_window_sigma=1.0,
+    build_center_targets=False,
+    center_positive_threshold=0.5,
+):
+    targets = _init_spotting_targets(num_clips, num_classes)
+    offset_targets, offset_masks = _init_center_regression_targets(num_clips)
+
+    for annotation in annotations:
+        time_str = annotation["gameTime"]
+        event = annotation["label"]
+        half = int(time_str[0])
+
+        minutes, seconds = time_str.split(' ')[-1].split(':')
+        minutes, seconds = int(minutes), int(seconds)
+        frame = framerate * (seconds + 60 * minutes)
+
+        if event not in dict_event or half > 2:
+            continue
+
+        class_index = dict_event[event]
+        clip_index = frame // window_size_frame
+        center_offset = _compute_normalized_center_offset(frame, clip_index, window_size_frame)
+
+        if target_mode == "soft_window_multiclass":
+            _set_soft_spotting_targets(
+                targets,
+                clip_index,
+                class_index,
+                radius=soft_window_radius,
+                sigma=soft_window_sigma,
+            )
+            for delta in range(-max(0, int(soft_window_radius)), max(0, int(soft_window_radius)) + 1):
+                target_clip_index = clip_index + delta
+                if target_clip_index < 0 or target_clip_index >= num_clips:
+                    continue
+
+                sigma = float(max(soft_window_sigma, 1e-6))
+                event_prob = float(np.exp(-((delta ** 2) / (2.0 * sigma * sigma))))
+                existing_event_prob = float(targets[target_clip_index, 1:].max()) if targets.shape[1] > 1 else 0.0
+                if event_prob + 1e-8 < existing_event_prob:
+                    continue
+
+                if build_center_targets:
+                    offset_targets[target_clip_index] = _compute_normalized_center_offset(
+                        frame,
+                        target_clip_index,
+                        window_size_frame,
+                    )
+                    offset_masks[target_clip_index] = 1.0 if event_prob >= float(center_positive_threshold) else 0.0
+        else:
+            _set_hard_spotting_target(targets, clip_index, class_index)
+            if build_center_targets and 0 <= clip_index < num_clips:
+                offset_targets[clip_index] = center_offset
+                offset_masks[clip_index] = 1.0
+
+    if build_center_targets:
+        return targets, offset_targets, offset_masks
+    return targets, None, None
 
 
 # ============================================================================
@@ -116,6 +224,7 @@ class SoccerNetCaptionsDual(Dataset):
         version=2,
         framerate=2,
         window_size=15,
+        llm_model_path="Qwen/Qwen2.5-7B"
     ):
         if split is None:
             split = ["train"]
@@ -171,27 +280,17 @@ class SoccerNetCaptionsDual(Dataset):
                 continue
 
             # ---------- 加载视觉特征 ----------
-            feat_half1 = np.load(os.path.join(vision_root, game, "1_" + features))
-            feat_half1 = np.pad(
-                feat_half1.reshape(-1, feat_half1.shape[-1]),
-                ((l_pad, r_pad), (0, 0)), "edge"
-            )
-            feat_half2 = np.load(os.path.join(vision_root, game, "2_" + features))
-            feat_half2 = np.pad(
-                feat_half2.reshape(-1, feat_half2.shape[-1]),
-                ((l_pad, r_pad), (0, 0)), "edge"
-            )
+            feat_half1 = np.load(os.path.join(vision_root, game, "1_" + features), mmap_mode="r")
+            feat_half2 = np.load(os.path.join(vision_root, game, "2_" + features), mmap_mode="r")
             self.game_feats.append((feat_half1, feat_half2))
 
             # ---------- 加载音频特征 ----------
-            audio_half1 = np.load(os.path.join(audio_root, game, "1_audio_clap.npy"))
+            audio_half1 = np.load(os.path.join(audio_root, game, "1_audio_clap.npy"), mmap_mode="r")
             audio_half1 = audio_half1.reshape(-1, audio_half1.shape[-1])
             # 对音频特征做与视觉相同的 padding，使窗口对齐
-            audio_half1 = np.pad(audio_half1, ((l_pad, r_pad), (0, 0)), "edge")
 
-            audio_half2 = np.load(os.path.join(audio_root, game, "2_audio_clap.npy"))
+            audio_half2 = np.load(os.path.join(audio_root, game, "2_audio_clap.npy"), mmap_mode="r")
             audio_half2 = audio_half2.reshape(-1, audio_half2.shape[-1])
-            audio_half2 = np.pad(audio_half2, ((l_pad, r_pad), (0, 0)), "edge")
             self.game_audio.append((audio_half1, audio_half2))
 
             # ---------- 加载标签 ----------
@@ -226,7 +325,7 @@ class SoccerNetCaptionsDual(Dataset):
         self.video_processor = SoccerNetVideoProcessor(self.window_size_frame)
 
         # ---------- 文本处理器 ----------
-        self.text_processor = TikTokenTextProcessor(self._get_corpus(clean_split))
+        self.text_processor = HFTextProcessor(llm_model_path)
         self.vocab_size = len(self.text_processor.vocab)
 
     def _get_corpus(self, split):
@@ -295,6 +394,11 @@ class SoccerNetClipsDual(Dataset):
         version=2,
         framerate=2,
         window_size=15,
+        target_mode="hard_multiclass",
+        soft_window_radius=2,
+        soft_window_sigma=1.0,
+        build_center_targets=False,
+        center_positive_threshold=0.5,
     ):
         if split is None:
             split = ["train"]
@@ -304,6 +408,11 @@ class SoccerNetClipsDual(Dataset):
         self.features = features
         self.window_size_frame = window_size * framerate
         self.version = version
+        self.target_mode = target_mode
+        self.soft_window_radius = int(soft_window_radius)
+        self.soft_window_sigma = float(soft_window_sigma)
+        self.build_center_targets = bool(build_center_targets)
+        self.center_positive_threshold = float(center_positive_threshold)
 
         self.listGames = getListGames(split, task="caption")
         labels_filename, num_classes, dict_event, _ = getMetaDataTask("caption", "SoccerNet", version)
@@ -316,6 +425,8 @@ class SoccerNetClipsDual(Dataset):
         self.game_vfeats = []
         self.game_afeats = []
         self.game_labels = []
+        self.game_offset_targets = []
+        self.game_offset_masks = []
         skipped = 0
 
         for game in tqdm(self.listGames, desc="Loading dual clips"):
@@ -326,18 +437,18 @@ class SoccerNetClipsDual(Dataset):
                 continue
 
             # 加载视觉特征并切 clip
-            feat_half1 = np.load(os.path.join(vision_root, game, "1_" + features))
+            feat_half1 = np.load(os.path.join(vision_root, game, "1_" + features), mmap_mode="r")
             feat_half1 = feat_half1.reshape(-1, feat_half1.shape[-1])
-            feat_half2 = np.load(os.path.join(vision_root, game, "2_" + features))
+            feat_half2 = np.load(os.path.join(vision_root, game, "2_" + features), mmap_mode="r")
             feat_half2 = feat_half2.reshape(-1, feat_half2.shape[-1])
 
             vclip_h1 = feats2clip(torch.from_numpy(feat_half1), stride=self.window_size_frame, clip_length=self.window_size_frame)
             vclip_h2 = feats2clip(torch.from_numpy(feat_half2), stride=self.window_size_frame, clip_length=self.window_size_frame)
 
             # 加载音频特征并切 clip
-            audio_half1 = np.load(os.path.join(audio_root, game, "1_audio_clap.npy"))
+            audio_half1 = np.load(os.path.join(audio_root, game, "1_audio_clap.npy"), mmap_mode="r")
             audio_half1 = audio_half1.reshape(-1, audio_half1.shape[-1])
-            audio_half2 = np.load(os.path.join(audio_root, game, "2_audio_clap.npy"))
+            audio_half2 = np.load(os.path.join(audio_root, game, "2_audio_clap.npy"), mmap_mode="r")
             audio_half2 = audio_half2.reshape(-1, audio_half2.shape[-1])
 
             aclip_h1 = feats2clip(torch.from_numpy(audio_half1), stride=self.window_size_frame, clip_length=self.window_size_frame)
@@ -354,30 +465,32 @@ class SoccerNetClipsDual(Dataset):
             # 加载标签
             labels = json.load(open(os.path.join(vision_root, game, self.labels_filename)))
 
-            label_half1 = np.zeros((n_clips_h1, self.num_classes + 1))
-            label_half1[:, 0] = 1  # 默认为背景类
-            label_half2 = np.zeros((n_clips_h2, self.num_classes + 1))
-            label_half2[:, 0] = 1
-
-            for annotation in labels["annotations"]:
-                time_str = annotation["gameTime"]
-                event = annotation["label"]
-                half = int(time_str[0])
-
-                minutes, seconds = time_str.split(' ')[-1].split(':')
-                minutes, seconds = int(minutes), int(seconds)
-                frame = framerate * (seconds + 60 * minutes)
-
-                if event not in self.dict_event or half > 2:
-                    continue
-                label = self.dict_event[event]
-
-                if half == 1 and frame // self.window_size_frame < n_clips_h1:
-                    label_half1[frame // self.window_size_frame][0] = 0
-                    label_half1[frame // self.window_size_frame][label + 1] = list(self.dict_event.keys()).index(event) + 1
-                if half == 2 and frame // self.window_size_frame < n_clips_h2:
-                    label_half2[frame // self.window_size_frame][0] = 0
-                    label_half2[frame // self.window_size_frame][label + 1] = list(self.dict_event.keys()).index(event) + 1
+            label_half1, offset_half1, offset_mask_half1 = _build_spotting_targets(
+                n_clips_h1,
+                self.num_classes,
+                [ann for ann in labels["annotations"] if int(ann["gameTime"][0]) == 1],
+                self.dict_event,
+                framerate=framerate,
+                window_size_frame=self.window_size_frame,
+                target_mode=self.target_mode,
+                soft_window_radius=self.soft_window_radius,
+                soft_window_sigma=self.soft_window_sigma,
+                build_center_targets=self.build_center_targets,
+                center_positive_threshold=self.center_positive_threshold,
+            )
+            label_half2, offset_half2, offset_mask_half2 = _build_spotting_targets(
+                n_clips_h2,
+                self.num_classes,
+                [ann for ann in labels["annotations"] if int(ann["gameTime"][0]) == 2],
+                self.dict_event,
+                framerate=framerate,
+                window_size_frame=self.window_size_frame,
+                target_mode=self.target_mode,
+                soft_window_radius=self.soft_window_radius,
+                soft_window_sigma=self.soft_window_sigma,
+                build_center_targets=self.build_center_targets,
+                center_positive_threshold=self.center_positive_threshold,
+            )
 
             self.game_vfeats.append(vclip_h1)
             self.game_vfeats.append(vclip_h2)
@@ -385,19 +498,40 @@ class SoccerNetClipsDual(Dataset):
             self.game_afeats.append(aclip_h2)
             self.game_labels.append(label_half1)
             self.game_labels.append(label_half2)
+            if self.build_center_targets:
+                self.game_offset_targets.append(offset_half1)
+                self.game_offset_targets.append(offset_half2)
+                self.game_offset_masks.append(offset_mask_half1)
+                self.game_offset_masks.append(offset_mask_half2)
 
         if self.game_vfeats:
             self.game_vfeats = np.concatenate(self.game_vfeats)
             self.game_afeats = np.concatenate(self.game_afeats)
             self.game_labels = np.concatenate(self.game_labels)
+            if self.build_center_targets:
+                self.game_offset_targets = np.concatenate(self.game_offset_targets)
+                self.game_offset_masks = np.concatenate(self.game_offset_masks)
+            else:
+                self.game_offset_targets = None
+                self.game_offset_masks = None
         else:
             self.game_vfeats = np.array([])
             self.game_afeats = np.array([])
             self.game_labels = np.array([])
+            self.game_offset_targets = None
+            self.game_offset_masks = None
 
         logging.info("Dual clips loaded: {} clips, {} games skipped".format(len(self.game_vfeats), skipped))
 
     def __getitem__(self, index):
+        if self.build_center_targets:
+            return (
+                self.game_vfeats[index, :, :],
+                self.game_afeats[index, :, :],
+                self.game_labels[index, :],
+                self.game_offset_targets[index],
+                self.game_offset_masks[index],
+            )
         return self.game_vfeats[index, :, :], self.game_afeats[index, :, :], self.game_labels[index, :]
 
     def __len__(self):
@@ -457,13 +591,13 @@ class SoccerNetClipsTestingDual(Dataset):
         game = self.listGames[index]
 
         # 视觉特征
-        feat_half1 = np.load(os.path.join(self.vision_root, game, "1_" + self.features))
-        feat_half2 = np.load(os.path.join(self.vision_root, game, "2_" + self.features))
+        feat_half1 = np.load(os.path.join(self.vision_root, game, "1_" + self.features), mmap_mode="r")
+        feat_half2 = np.load(os.path.join(self.vision_root, game, "2_" + self.features), mmap_mode="r")
 
         # 音频特征
-        audio_half1 = np.load(os.path.join(self.audio_root, game, "1_audio_clap.npy"))
+        audio_half1 = np.load(os.path.join(self.audio_root, game, "1_audio_clap.npy"), mmap_mode="r")
         audio_half1 = audio_half1.reshape(-1, audio_half1.shape[-1])
-        audio_half2 = np.load(os.path.join(self.audio_root, game, "2_audio_clap.npy"))
+        audio_half2 = np.load(os.path.join(self.audio_root, game, "2_audio_clap.npy"), mmap_mode="r")
         audio_half2 = audio_half2.reshape(-1, audio_half2.shape[-1])
 
         # 标签
@@ -592,17 +726,13 @@ class SoccerNetClassificationDual(Dataset):
                 continue
 
             # 视觉
-            feat_h1 = np.load(os.path.join(vision_root, game, "1_" + features))
-            feat_h1 = np.pad(feat_h1.reshape(-1, feat_h1.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
-            feat_h2 = np.load(os.path.join(vision_root, game, "2_" + features))
-            feat_h2 = np.pad(feat_h2.reshape(-1, feat_h2.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
+            feat_h1 = np.load(os.path.join(vision_root, game, "1_" + features), mmap_mode="r")
+            feat_h2 = np.load(os.path.join(vision_root, game, "2_" + features), mmap_mode="r")
             self.game_feats.append((feat_h1, feat_h2))
 
             # 音频
-            audio_h1 = np.load(os.path.join(audio_root, game, "1_audio_clap.npy"))
-            audio_h1 = np.pad(audio_h1.reshape(-1, audio_h1.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
-            audio_h2 = np.load(os.path.join(audio_root, game, "2_audio_clap.npy"))
-            audio_h2 = np.pad(audio_h2.reshape(-1, audio_h2.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
+            audio_h1 = np.load(os.path.join(audio_root, game, "1_audio_clap.npy"), mmap_mode="r")
+            audio_h2 = np.load(os.path.join(audio_root, game, "2_audio_clap.npy"), mmap_mode="r")
             self.game_audio.append((audio_h1, audio_h2))
 
             # 标签
@@ -616,7 +746,8 @@ class SoccerNetClassificationDual(Dataset):
                 minutes, seconds = time_str.split(' ')[-1].split(':')
                 minutes, seconds = int(minutes), int(seconds)
                 frame = framerate * (seconds + 60 * minutes)
-                self.data.append(((valid_game_id, half - 1, frame), self.class_labels.index(event)))
+                caption_text = annotation.get("anonymized", "")
+                self.data.append(((valid_game_id, half - 1, frame), self.class_labels.index(event), caption_text))
 
             valid_game_id += 1
 
@@ -626,53 +757,57 @@ class SoccerNetClassificationDual(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        clip_id, class_label = self.data[idx]
+        clip_id, class_label, caption_text = self.data[idx]
         vfeats = self.video_processor(clip_id, self.game_feats)
         afeats = self.video_processor(clip_id, self.game_audio)
-        return vfeats, afeats, class_label
+        return vfeats, afeats, class_label, caption_text
 
 
 # ============================================================================
 #  5. 双模态 Collate 函数
 # ============================================================================
 
-def collate_fn_gpt_dual(batch):
-    """
-    双模态 GPT 版 collate 函数。
+class CollateGPTDual:
+    def __init__(self, llm_model_path="Qwen/Qwen2.5-7B"):
+        from transformers import AutoTokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(llm_model_path, trust_remote_code=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-    batch 中每个元素为:
-        (vfeats, afeats, caption_tokens, game_id, caption_id, caption_str)
+    def __call__(self, batch):
+        """
+        双模态 GPT 版 collate 函数。
+        batch 中每个元素为:
+            (vfeats, afeats, caption_tokens, game_id, caption_id, caption_str)
+        Returns:
+            (vfeats_batch, afeats_batch, tokens_batch), lengths, mask, captions, idx
+        """
+        vfeats_list = [torch.tensor(t[0], dtype=torch.float32) for t in batch]
+        afeats_list = [torch.tensor(t[1], dtype=torch.float32) for t in batch]
+        captions = [t[-1] for t in batch]         # 原始 caption 字符串
+        idx = [(t[-3], t[-2]) for t in batch]     # (game_id, caption_id)
 
-    Returns:
-        (vfeats_batch, afeats_batch, tokens_batch), lengths, mask, captions, idx
-    """
-    enc = tiktoken.get_encoding("gpt2")
-    eot = enc.eot_token
-    encode = lambda s: enc.encode(s, allowed_special=set())
+        # token 化: 添加 BOS (":") 和 EOT
+        bos_ids = self.tokenizer.encode(":", add_special_tokens=False)
+        eos_id = self.tokenizer.eos_token_id
+        
+        tokens = [
+            (bos_ids + t[2] + [eos_id]) if t[2] else [self.tokenizer.pad_token_id, self.tokenizer.pad_token_id]
+            for t in batch
+        ]
+        tokens = [torch.tensor(t, dtype=torch.long) for t in tokens]
 
-    vfeats_list = [torch.tensor(t[0], dtype=torch.float32) for t in batch]
-    afeats_list = [torch.tensor(t[1], dtype=torch.float32) for t in batch]
-    captions = [t[-1] for t in batch]         # 原始 caption 字符串
-    idx = [(t[-3], t[-2]) for t in batch]     # (game_id, caption_id)
+        # padding
+        lengths = torch.tensor([len(t) for t in tokens])
+        tokens = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        mask = (tokens != self.tokenizer.pad_token_id)
 
-    # token 化: 添加 BOS (":") 和 EOT
-    bos_ids = encode(":")
-    tokens = [
-        (bos_ids + t[2] + [eot]) if t[2] else [14841, 14841]
-        for t in batch
-    ]
-    tokens = [torch.tensor(t, dtype=torch.long) for t in tokens]
+        # stack 视觉和音频特征
+        vfeats_batch = torch.stack(vfeats_list)
+        afeats_batch = torch.stack(afeats_list)
 
-    # padding
-    lengths = torch.tensor([len(t) for t in tokens])
-    tokens = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True, padding_value=14841)
-    mask = (tokens != 14841)
-
-    # stack 视觉和音频特征
-    vfeats_batch = torch.stack(vfeats_list)
-    afeats_batch = torch.stack(afeats_list)
-
-    return (vfeats_batch, afeats_batch, tokens), lengths, mask, captions, idx
+        return (vfeats_batch, afeats_batch, tokens), lengths, mask, captions, idx
 
 
 def collate_fn_padd_dual(batch):
@@ -721,6 +856,7 @@ class PredictionCaptionsDual(Dataset):
         version=2,
         framerate=2,
         window_size=15,
+        llm_model_path="Qwen/Qwen2.5-7B"
     ):
         if split is None:
             split = ["test"]
@@ -757,17 +893,13 @@ class PredictionCaptionsDual(Dataset):
                 continue
 
             # 视觉
-            feat_h1 = np.load(os.path.join(vision_root, game, "1_" + features))
-            feat_h1 = np.pad(feat_h1.reshape(-1, feat_h1.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
-            feat_h2 = np.load(os.path.join(vision_root, game, "2_" + features))
-            feat_h2 = np.pad(feat_h2.reshape(-1, feat_h2.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
+            feat_h1 = np.load(os.path.join(vision_root, game, "1_" + features), mmap_mode="r")
+            feat_h2 = np.load(os.path.join(vision_root, game, "2_" + features), mmap_mode="r")
             self.game_feats.append((feat_h1, feat_h2))
 
             # 音频
-            audio_h1 = np.load(os.path.join(audio_root, game, "1_audio_clap.npy"))
-            audio_h1 = np.pad(audio_h1.reshape(-1, audio_h1.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
-            audio_h2 = np.load(os.path.join(audio_root, game, "2_audio_clap.npy"))
-            audio_h2 = np.pad(audio_h2.reshape(-1, audio_h2.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
+            audio_h1 = np.load(os.path.join(audio_root, game, "1_audio_clap.npy"), mmap_mode="r")
+            audio_h2 = np.load(os.path.join(audio_root, game, "2_audio_clap.npy"), mmap_mode="r")
             self.game_audio.append((audio_h1, audio_h2))
 
             preds = json.load(open(pred_path))
@@ -790,7 +922,7 @@ class PredictionCaptionsDual(Dataset):
         self.path = vision_root
 
         self.video_processor = SoccerNetVideoProcessor(self.window_size_frame)
-        self.text_processor = TikTokenTextProcessor(self._get_corpus())
+        self.text_processor = HFTextProcessor(llm_model_path)
         self.vocab_size = len(self.text_processor.vocab)
 
     def _get_corpus(self):

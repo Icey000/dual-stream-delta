@@ -12,20 +12,133 @@ import torch
 
 import logging
 import json
-
 from collections import Counter
-from torchtext.vocab import vocab
-
 from SoccerNet.Downloader import getListGames
 from SoccerNet.Downloader import SoccerNetDownloader
 from SoccerNet.Evaluation.utils import getMetaDataTask
 from torch.utils.data.dataloader import default_collate
 import numpy as np
-import tiktoken
+from transformers import AutoTokenizer
 
 PAD_TOKEN = 0
 SOS_TOKEN = 1
 EOS_TOKEN = 2
+
+
+def _init_spotting_targets(num_clips, num_classes):
+    targets = np.zeros((num_clips, num_classes + 1), dtype=np.float32)
+    targets[:, 0] = 1.0
+    return targets
+
+
+def _init_center_regression_targets(num_clips):
+    return np.zeros((num_clips,), dtype=np.float32), np.zeros((num_clips,), dtype=np.float32)
+
+
+def _compute_normalized_center_offset(frame, clip_index, window_size_frame):
+    clip_center = (clip_index + 0.5) * float(window_size_frame)
+    offset = (float(frame) - clip_center) / float(window_size_frame)
+    return float(np.clip(offset, -1.0, 1.0))
+
+
+def _set_hard_spotting_target(targets, clip_index, class_index):
+    if clip_index < 0 or clip_index >= targets.shape[0]:
+        return
+    targets[clip_index, :] = 0.0
+    targets[clip_index, class_index + 1] = 1.0
+
+
+def _set_soft_spotting_targets(targets, center_clip, class_index, radius=2, sigma=1.0):
+    if center_clip < 0 or center_clip >= targets.shape[0]:
+        return
+
+    radius = max(0, int(radius))
+    sigma = float(sigma)
+    if sigma <= 0:
+        sigma = 1.0
+
+    for delta in range(-radius, radius + 1):
+        clip_index = center_clip + delta
+        if clip_index < 0 or clip_index >= targets.shape[0]:
+            continue
+
+        event_prob = float(np.exp(-((delta ** 2) / (2.0 * sigma * sigma))))
+        event_prob = min(max(event_prob, 0.0), 1.0)
+        existing_event_prob = float(targets[clip_index, 1:].max()) if targets.shape[1] > 1 else 0.0
+        if event_prob < existing_event_prob:
+            continue
+
+        targets[clip_index, :] = 0.0
+        targets[clip_index, 0] = 1.0 - event_prob
+        targets[clip_index, class_index + 1] = event_prob
+
+
+def _build_spotting_targets(
+    num_clips,
+    num_classes,
+    annotations,
+    dict_event,
+    framerate,
+    window_size_frame,
+    target_mode="hard_multiclass",
+    soft_window_radius=2,
+    soft_window_sigma=1.0,
+    build_center_targets=False,
+    center_positive_threshold=0.5,
+):
+    targets = _init_spotting_targets(num_clips, num_classes)
+    offset_targets, offset_masks = _init_center_regression_targets(num_clips)
+
+    for annotation in annotations:
+        time = annotation["gameTime"]
+        event = annotation["label"]
+
+        half = int(time[0])
+        minutes, seconds = time.split(' ')[-1].split(':')
+        minutes, seconds = int(minutes), int(seconds)
+        frame = framerate * (seconds + 60 * minutes)
+
+        if event not in dict_event or half > 2:
+            continue
+
+        class_index = dict_event[event]
+        clip_index = frame // window_size_frame
+        center_offset = _compute_normalized_center_offset(frame, clip_index, window_size_frame)
+
+        if target_mode == "soft_window_multiclass":
+            _set_soft_spotting_targets(
+                targets,
+                clip_index,
+                class_index,
+                radius=soft_window_radius,
+                sigma=soft_window_sigma,
+            )
+            for delta in range(-max(0, int(soft_window_radius)), max(0, int(soft_window_radius)) + 1):
+                target_clip_index = clip_index + delta
+                if target_clip_index < 0 or target_clip_index >= num_clips:
+                    continue
+
+                event_prob = float(np.exp(-((delta ** 2) / (2.0 * float(max(soft_window_sigma, 1e-6)) ** 2))))
+                existing_event_prob = float(targets[target_clip_index, 1:].max()) if targets.shape[1] > 1 else 0.0
+                if event_prob + 1e-8 < existing_event_prob:
+                    continue
+
+                if build_center_targets:
+                    offset_targets[target_clip_index] = _compute_normalized_center_offset(
+                        frame,
+                        target_clip_index,
+                        window_size_frame,
+                    )
+                    offset_masks[target_clip_index] = 1.0 if event_prob >= float(center_positive_threshold) else 0.0
+        else:
+            _set_hard_spotting_target(targets, clip_index, class_index)
+            if build_center_targets and 0 <= clip_index < num_clips:
+                offset_targets[clip_index] = center_offset
+                offset_masks[clip_index] = 1.0
+
+    if build_center_targets:
+        return targets, offset_targets, offset_masks
+    return targets, None, None
 
 def collate_fn_padd(batch):
     '''
@@ -46,26 +159,40 @@ def collate_fn_padd(batch):
     mask = (tokens != PAD_TOKEN)
     return default_collate([t[:-4] for t in batch ]) + [tokens], lengths, mask, captions, idx
 
-def collate_fn_gpt(batch):
-    '''
-    Padds batch of variable length
+class CollateGPT:
+    def __init__(self, llm_model_path="Qwen/Qwen2.5-7B"):
+        self.tokenizer = AutoTokenizer.from_pretrained(llm_model_path, trust_remote_code=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-    note: it converts things ToTensor manually here since the ToTensor transform
-    assume it takes in images rather than arbitrary tensors.
-    '''
-    enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-    captions = [t[-1] for t in batch]
-    idx = [t[-3:-1] for t in batch]
-    ## padd
-    tokens = [(encode(":") + t[-4] + [enc.eot_token]) if t[-4] else [14841, 14841] for t in batch]
-    tokens = [torch.Tensor(t).long() for t in tokens ]
-    ## get sequence lengths
-    lengths = torch.tensor([ len(t) for t in tokens ])
-    tokens = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True, padding_value=14841)
-    ## compute mask
-    mask = (tokens != 14841)
-    return default_collate([t[:-4] for t in batch]) + [tokens], lengths, mask, captions, idx
+    def __call__(self, batch):
+        '''
+        Padds batch of variable length
+        note: it converts things ToTensor manually here since the ToTensor transform
+        assume it takes in images rather than arbitrary tensors.
+        '''
+        captions = [t[-1] for t in batch]
+        idx = [t[-3:-1] for t in batch]
+        
+        # token化: 添加 BOS (":") 和 EOS
+        bos_ids = self.tokenizer.encode(":", add_special_tokens=False)
+        eos_id = self.tokenizer.eos_token_id
+        
+        tokens = [
+            (bos_ids + t[-4] + [eos_id]) if t[-4] else [self.tokenizer.pad_token_id, self.tokenizer.pad_token_id]
+            for t in batch
+        ]
+        tokens = [torch.Tensor(t).long() for t in tokens]
+        
+        ## get sequence lengths
+        lengths = torch.tensor([len(t) for t in tokens])
+        tokens = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        
+        ## compute mask
+        mask = (tokens != self.tokenizer.pad_token_id)
+        
+        return default_collate([t[:-4] for t in batch]) + [tokens], lengths, mask, captions, idx
 
 
 
@@ -95,12 +222,19 @@ class SoccerNetClips(Dataset):
     This class is used to download and pre-compute clips from the SoccerNet dataset for spotting training phase.
     """
     def __init__(self, path, features="ResNET_PCA512.npy", split=["train"], version=2, 
-                framerate=2, window_size=15):
+                framerate=2, window_size=15, target_mode="hard_multiclass",
+                soft_window_radius=2, soft_window_sigma=1.0,
+                build_center_targets=False, center_positive_threshold=0.5):
         self.path = path
         self.listGames = getListGames(split, task="caption")
         self.features = features
         self.window_size_frame = window_size*framerate
         self.version = version
+        self.target_mode = target_mode
+        self.soft_window_radius = int(soft_window_radius)
+        self.soft_window_sigma = float(soft_window_sigma)
+        self.build_center_targets = bool(build_center_targets)
+        self.center_positive_threshold = float(center_positive_threshold)
         labels, num_classes, dict_event, _ = getMetaDataTask("caption", "SoccerNet", version)
         self.labels = labels
         self.num_classes = num_classes
@@ -118,13 +252,15 @@ class SoccerNetClips(Dataset):
 
         self.game_feats = list()
         self.game_labels = list()
+        self.game_offset_targets = list()
+        self.game_offset_masks = list()
 
         # NARY_CAPTION_V2 = {"corner" : 0,"substitution" : 0,"y-card" : 0,"whistle" : 0,"soccer-ball" : 0,"injury" : 0,"penalty" :
         for game in tqdm(self.listGames):
             # Load features
-            feat_half1 = np.load(os.path.join(self.path, game, "1_" + self.features))
+            feat_half1 = np.load(os.path.join(self.path, game, "1_" + self.features), mmap_mode="r")
             feat_half1 = feat_half1.reshape(-1, feat_half1.shape[-1])
-            feat_half2 = np.load(os.path.join(self.path, game, "2_" + self.features))
+            feat_half2 = np.load(os.path.join(self.path, game, "2_" + self.features), mmap_mode="r")
             feat_half2 = feat_half2.reshape(-1, feat_half2.shape[-1])
 
             feat_half1 = feats2clip(torch.from_numpy(feat_half1), stride=self.window_size_frame, clip_length=self.window_size_frame)
@@ -133,49 +269,51 @@ class SoccerNetClips(Dataset):
             # Load labels
             labels = json.load(open(os.path.join(self.path, game, self.labels)))
 
-            label_half1 = np.zeros((feat_half1.shape[0], self.num_classes+1))
-            label_half1[:,0]=1 # those are BG classes
-            label_half2 = np.zeros((feat_half2.shape[0], self.num_classes+1))
-            label_half2[:,0]=1 # those are BG classes
-
-
-            for annotation in labels["annotations"]:
-
-                time = annotation["gameTime"]
-                event = annotation["label"]
-
-                half = int(time[0])
-
-                minutes, seconds = time.split(' ')[-1].split(':')
-                minutes, seconds = int(minutes), int(seconds)
-                frame = framerate * ( seconds + 60 * minutes ) 
-
-                
-                if event not in self.dict_event or half > 2:
-                    continue
-                label = self.dict_event[event]
-
-                # if label outside temporal of view
-                if half == 1 and frame//self.window_size_frame>=label_half1.shape[0]:
-                    continue
-                if half == 2 and frame//self.window_size_frame>=label_half2.shape[0]:
-                    continue
-
-                if half == 1:
-                    label_half1[frame//self.window_size_frame][0] = 0 # not BG anymore
-                    label_half1[frame//self.window_size_frame][label+1] = list(self.dict_event.keys()).index(event) + 1 # 0 is for no action
-
-                if half == 2:
-                    label_half2[frame//self.window_size_frame][0] = 0 # not BG anymore
-                    label_half2[frame//self.window_size_frame][label+1] = list(self.dict_event.keys()).index(event) + 1 # that's my class
+            label_half1, offset_half1, offset_mask_half1 = _build_spotting_targets(
+                feat_half1.shape[0],
+                self.num_classes,
+                [ann for ann in labels["annotations"] if int(ann["gameTime"][0]) == 1],
+                self.dict_event,
+                framerate=framerate,
+                window_size_frame=self.window_size_frame,
+                target_mode=self.target_mode,
+                soft_window_radius=self.soft_window_radius,
+                soft_window_sigma=self.soft_window_sigma,
+                build_center_targets=self.build_center_targets,
+                center_positive_threshold=self.center_positive_threshold,
+            )
+            label_half2, offset_half2, offset_mask_half2 = _build_spotting_targets(
+                feat_half2.shape[0],
+                self.num_classes,
+                [ann for ann in labels["annotations"] if int(ann["gameTime"][0]) == 2],
+                self.dict_event,
+                framerate=framerate,
+                window_size_frame=self.window_size_frame,
+                target_mode=self.target_mode,
+                soft_window_radius=self.soft_window_radius,
+                soft_window_sigma=self.soft_window_sigma,
+                build_center_targets=self.build_center_targets,
+                center_positive_threshold=self.center_positive_threshold,
+            )
             
             self.game_feats.append(feat_half1)
             self.game_feats.append(feat_half2)
             self.game_labels.append(label_half1)
             self.game_labels.append(label_half2)
+            if self.build_center_targets:
+                self.game_offset_targets.append(offset_half1)
+                self.game_offset_targets.append(offset_half2)
+                self.game_offset_masks.append(offset_mask_half1)
+                self.game_offset_masks.append(offset_mask_half2)
 
         self.game_feats = np.concatenate(self.game_feats)
         self.game_labels = np.concatenate(self.game_labels)
+        if self.build_center_targets:
+            self.game_offset_targets = np.concatenate(self.game_offset_targets)
+            self.game_offset_masks = np.concatenate(self.game_offset_masks)
+        else:
+            self.game_offset_targets = None
+            self.game_offset_masks = None
 
 
 
@@ -188,6 +326,13 @@ class SoccerNetClips(Dataset):
             clip_labels (np.array): clip of labels for the segmentation.
             clip_targets (np.array): clip of targets for the spotting.
         """
+        if self.build_center_targets:
+            return (
+                self.game_feats[index, :, :],
+                self.game_labels[index, :],
+                self.game_offset_targets[index],
+                self.game_offset_masks[index],
+            )
         return self.game_feats[index,:,:], self.game_labels[index,:]
 
     def __len__(self):
@@ -291,7 +436,7 @@ class SoccerNetCaptions(Dataset):
     """
     This class is used to download and pre-compute clips and captions from the SoccerNet dataset for captining training phase.
     """
-    def __init__(self, path, features="ResNET_TF2_PCA512.npy", split=["train"], version=2, framerate=2, window_size=15, aug_ratio=0.0):
+    def __init__(self, path, features="ResNET_TF2_PCA512.npy", split=["train"], version=2, framerate=2, window_size=15, aug_ratio=0.0, llm_model_path="Qwen/Qwen2.5-7B"):
         self.path = path
         self.split = split
         split = [s for s in split if s!= "challenge"]
@@ -314,10 +459,8 @@ class SoccerNetCaptions(Dataset):
 
         for game_id, game in enumerate(tqdm(looper)):
             # Load features
-            feat_half1 = np.load(os.path.join(self.path, game, "1_" + self.features))
-            feat_half1 = np.pad(feat_half1.reshape(-1, feat_half1.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
-            feat_half2 = np.load(os.path.join(self.path, game, "2_" + self.features))
-            feat_half2 = np.pad(feat_half2.reshape(-1, feat_half2.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
+            feat_half1 = np.load(os.path.join(self.path, game, "1_" + self.features), mmap_mode="r")
+            feat_half2 = np.load(os.path.join(self.path, game, "2_" + self.features), mmap_mode="r")
             
             self.game_feats.append((feat_half1, feat_half2)) 
 
@@ -341,7 +484,7 @@ class SoccerNetCaptions(Dataset):
         #launch a VideoProcessor that will create a clip around a caption
         self.video_processor = SoccerNetVideoProcessor(self.window_size_frame)
         #launch a TextProcessor that will tokenize a caption
-        self.text_processor = TikTokenTextProcessor(self.getCorpus(split=["train"]))
+        self.text_processor = HFTextProcessor(llm_model_path)
         self.vocab_size = len(self.text_processor.vocab)
 
     def __len__(self):
@@ -415,10 +558,8 @@ class SoccerNetClassification(Dataset):
         #     looper = self.listGames[10:20]
         for game_id, game in enumerate(tqdm(looper)):
             # Load features
-            feat_half1 = np.load(os.path.join(self.path, game, "1_" + self.features))
-            feat_half1 = np.pad(feat_half1.reshape(-1, feat_half1.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
-            feat_half2 = np.load(os.path.join(self.path, game, "2_" + self.features))
-            feat_half2 = np.pad(feat_half2.reshape(-1, feat_half2.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
+            feat_half1 = np.load(os.path.join(self.path, game, "1_" + self.features), mmap_mode="r")
+            feat_half2 = np.load(os.path.join(self.path, game, "2_" + self.features), mmap_mode="r")
             
             self.game_feats.append((feat_half1, feat_half2)) 
 
@@ -468,69 +609,48 @@ class SoccerNetVideoProcessor(object):
 
     def __init__(self, clip_length):
         self.clip_length = clip_length
+        self.l_pad = clip_length // 2 + clip_length % 2
+        self.r_pad = clip_length // 2
 
     def __call__(self, video_fn, feats):
         video_id, half, frame = video_fn
         video_feature = feats[video_id][half]
-        #make sure that the clip lenght is right
-        start = min(frame, video_feature.shape[0] - self.clip_length)
-        video_feature = video_feature[start : start + self.clip_length]
+        
+        original_length = video_feature.shape[0]
+        # Simulate padded length
+        padded_length = original_length + self.l_pad + self.r_pad
+        # Keep original logic which assumes the feature length is padded_length
+        start = min(max(frame, 0), max(0, padded_length - self.clip_length))
+        
+        real_start = start - self.l_pad
+        real_end = real_start + self.clip_length
+        
+        # Use np.clip to handle out-of-bounds indices by edge padding
+        indices = np.clip(np.arange(real_start, real_end), 0, max(0, original_length - 1))
+        
+        return video_feature[indices]
 
-        return video_feature
-
-class TikTokenTextProcessor(object):
-    def __init__(self, corpus, min_freq=5):
-        enc = tiktoken.get_encoding("gpt2")
-        self.encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-        self.decode = lambda l: enc.decode(l)
-        self.vocab = [True] * enc.n_vocab
+class HFTextProcessor(object):
+    def __init__(self, llm_model_path="Qwen/Qwen2.5-7B"):
+        self.tokenizer = AutoTokenizer.from_pretrained(llm_model_path, trust_remote_code=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        # Compatibility with legacy dataset.py
+        self.vocab = [True] * len(self.tokenizer)
 
     def __call__(self, text):
-        return self.encode(text)
+        return self.tokenizer.encode(text, add_special_tokens=False)
 
     def detokenize(self, tokens):
-        return self.decode(tokens[0].tolist())
-        '''
-        # tokens is a list of scalar tensors or ints; convert each to plain int
-        int_tokens = [int(t) for t in tokens]
-        return self.decode(int_tokens)
-        '''
+        if isinstance(tokens, list) and len(tokens) > 0 and isinstance(tokens[0], torch.Tensor):
+            tokens = tokens[0].tolist()
+        return self.tokenizer.decode(tokens, skip_special_tokens=True)
        
 
 
-class SoccerNetTextProcessor(object):
-    """
-    A generic Text processor
-    tokenize a string of text on-the-fly.
-    """
-
-    def __init__(self, corpus, min_freq=5):
-        import spacy
-        spacy_token = spacy.load("en_core_web_sm").tokenizer
-        # Add special case rule
-        spacy_token.add_special_case("[PLAYER]", [{"ORTH": "[PLAYER]"}])
-        spacy_token.add_special_case("[COACH]", [{"ORTH": "[COACH]"}])
-        spacy_token.add_special_case("[TEAM]", [{"ORTH": "[TEAM]"}])
-        spacy_token.add_special_case("([TEAM])", [{"ORTH": "([TEAM])"}])
-        spacy_token.add_special_case("[REFEREE]", [{"ORTH": "[REFEREE]"}])
-        self.tokenizer = lambda s: [c.text for c in spacy_token(s)]
-        self.min_freq = min_freq
-        self.build_vocab(corpus)
-    
-    def build_vocab(self, corpus):
-        counter = Counter([token for c in corpus for token in self.tokenizer(c)])
-        voc = vocab(counter, min_freq=self.min_freq, specials=["[PAD]", "[SOS]", "[EOS]", "[UNK]", "[MASK]", "[CLS]"])
-        voc.set_default_index(voc['[UNK]'])
-        self.vocab = voc
-    
-    def __call__(self, text):
-        return self.vocab(self.tokenizer(text))
-    
-    def detokenize(self, tokens):
-        return " ".join(self.vocab.lookup_tokens(tokens))
-
 class PredictionCaptions(Dataset):
-    def __init__(self, SoccerNetPath, PredictionPath, features="ResNET_TF2_PCA512.npy", split=["train"], version=2, framerate=2, window_size=15):
+    def __init__(self, SoccerNetPath, PredictionPath, features="ResNET_TF2_PCA512.npy", split=["train"], version=2, framerate=2, window_size=15, llm_model_path="Qwen/Qwen2.5-7B"):
         self.path = SoccerNetPath
         self.PredictionPath = PredictionPath
         self.listGames = getListGames(split, task="caption")
@@ -552,10 +672,8 @@ class PredictionCaptions(Dataset):
 
         for game_id, game in enumerate(tqdm(self.listGames)):
             # Load features
-            feat_half1 = np.load(os.path.join(self.path, game, "1_" + self.features))
-            feat_half1 = np.pad(feat_half1.reshape(-1, feat_half1.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
-            feat_half2 = np.load(os.path.join(self.path, game, "2_" + self.features))
-            feat_half2 = np.pad(feat_half2.reshape(-1, feat_half2.shape[-1]), ((l_pad, r_pad), (0, 0)), "edge")
+            feat_half1 = np.load(os.path.join(self.path, game, "1_" + self.features), mmap_mode="r")
+            feat_half2 = np.load(os.path.join(self.path, game, "2_" + self.features), mmap_mode="r")
             
             self.game_feats.append((feat_half1, feat_half2)) 
 
@@ -581,7 +699,7 @@ class PredictionCaptions(Dataset):
         #launch a VideoProcessor that will create a clip around a caption
         self.video_processor = SoccerNetVideoProcessor(self.window_size_frame)
         #launch a TextProcessor that will tokenize a caption
-        self.text_processor = TikTokenTextProcessor(self.getCorpus(split=["train"]))
+        self.text_processor = HFTextProcessor(llm_model_path)
         self.vocab_size = len(self.text_processor.vocab)
     
     def __len__(self):
@@ -610,7 +728,6 @@ class PredictionCaptions(Dataset):
         """
         string = self.text_processor.detokenize(tokens)
         return string
-        #return string.rstrip(f" {self.text_processor.vocab.lookup_token(EOS_TOKEN)}") if remove_EOS else string
     
     def getCorpus(self, split=["train"]):
         """
@@ -621,18 +738,3 @@ class PredictionCaptions(Dataset):
         """
         corpus = [annotation['anonymized'] for game in getListGames(split, task="caption") for annotation in json.load(open(os.path.join(self.path, game, self.labels)))["annotations"]]
         return corpus
-
-
-if __name__ == '__main__':
-    from torch.utils.data import DataLoader
-    torch.manual_seed(0)
-    np.random.seed(0)
-    root = "/scratch/users/hmkhallati/SoccerNet/"
-    dataset_Test  = SoccerNetCaptions(path=root, features="ResNET_TF2_PCA512.npy", split="test", version=2, framerate=2, window_size=15)
-    test_loader = torch.utils.data.DataLoader(dataset_Test,
-        batch_size=1, shuffle=False, pin_memory=True)
-    batch = next(iter(test_loader))
-    (feats, caption), lengths, mask, caption_or, idx = batch
-    print(feats, caption)
-    print(test_loader.detokenize([55, 22, 33, 2]))
-    print(idx)

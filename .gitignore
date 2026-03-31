@@ -3,37 +3,39 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# PyTorch Checkpoints and Models
+# PyTorch/Deep Learning
+models/
 *.pth
-*.pt
+*.pth.tar
 *.ckpt
+*.pt
+*.bin
 *.safetensors
+runs/
+wandb/
+checkpoints/
 
-# Media and Datasets
-/data/
-*.mkv
-*.mp4
-*.wav
-*.flac
-*.npy
-*.npz
+# Caches
+.cache/
+.pytest_cache/
 
-# Logs, Debugs, and Temporary Texts
-*.log
-shape_debug_*.txt
-broken_wav_games.txt
-missing_audio_games.txt
-need_720p_games.txt
-
-# Virtual Environments
-venv/
-env/
+# Environments
 .env
 .venv
-conda-env/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
-# IDE and OS
+# IDEs
 .vscode/
 .idea/
+
+# OS generated files
 .DS_Store
 Thumbs.db
+
+# Logs and outputs
+*.log
+deployment/__pycache__/

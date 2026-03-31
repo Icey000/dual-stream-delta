@@ -29,7 +29,7 @@ import contextlib
 import subprocess
 
 # ================= 配置区 =================
-ROOT_DIR = os.environ.get("SOCCERNET_ROOT", "./data/SoccerNet")
+ROOT_DIR = os.getenv("SOCCERNET_AUDIO_ROOT", "/path/to/SoccerNet-audio")
 SPLITS   = ["train", "valid", "test"]
 
 MIN_DURATION_SEC   = 20 * 60   # WAV 最短时长阈值：20 分钟（正常半场 ≥ 40 分钟）

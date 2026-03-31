@@ -28,14 +28,14 @@
 set -e   # 遇到错误停止
 
 # ──────────────────────────────────────────────────────────
-#  Python 路径配置（避免在脚本里 conda activate 的坑）
-#  conda activate 在子 shell 里不生效，直接用完整路径最稳
+#  Python 路径与工作目录配置
+#  公开版默认使用当前目录；需要时可由调用者覆盖环境变量
 # ──────────────────────────────────────────────────────────
-PYTHON_APOLLO="python"
-PYTHON_CLAP="python"
-WORKDIR="./"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_APOLLO="${PYTHON_APOLLO:-python}"
+PYTHON_CLAP="${PYTHON_CLAP:-python}"
+WORKDIR="${WORKDIR:-$SCRIPT_DIR}"
 
-# 切到工作目录（只需一次）
 cd "$WORKDIR"
 
 echo ""

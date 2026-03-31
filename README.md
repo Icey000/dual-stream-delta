@@ -1,79 +1,186 @@
-# SoccerNet Dual-Stream Dense Video Captioning
+# SoccerNet Dual-Stream Qwen Dense Video Captioning
 
 ## Overview
-A Dense Video Captioning (DVC) and Action Spotting system for the SoccerNet dataset. This project was originally built upon the Deltalab baseline (https://github.com/gladuz/soccernet-caption-deltalab) and serves as an **Architectural Exploration** and **Proof of Concept** for multi-modal feature fusion in sports video comprehension. The primary objective is to investigate how late-fusion mechanisms can integrate distinct streams of information to contextualize complex broadcasts.
+A Dense Video Captioning and Action Spotting system for the SoccerNet dataset. This repository is a cleaned-up public version of my current dual-stream Qwen project and is intended as both an architectural exploration and a deployment-oriented presentation repo. The system reads pre-extracted visual and audio features, fuses them with a dual-stream Q-Former, and generates event captions with a Qwen2.5 decoder fine-tuned with LoRA.
 
 ## Core Innovation
-The core innovation of this repository is the refactoring of the original single-stream visual Q-Former into a **Dual-Stream Q-Former**. By introducing an independent Audio stream alongside the Video stream, we implemented a multimodal audio-visual fusion mechanism directly before the downstream task modules. This decoupled approach allows both modalities to be processed asynchronously before being effectively combined.
+The main architectural change is the evolution from an earlier GPT-2-based caption decoder to a **Dual-Stream Qwen** setup. Instead of relying on a single visual stream, the model processes visual and audio features through separate branches and fuses them before caption generation. This allows the system to align cues such as crowd reactions, whistles, and commentary-like audio signatures with broadcast visual context.
 
 ## Architecture
 
 ![Dual-Stream Architecture](./assets/arch.png)
 
-The Dual-Stream Video+Audio Q-Former fusion logic is designed to dynamically align and synthesize multimodal broadcast data. Individual visual and audio abstractions (such as Baidu/ResNET and LAION-CLAP embeddings) are parsed into their respective encoders. Subsequently, a late-fusion Q-Former layer actively queries both the dense visual representations and the audio temporal representations. By employing learned cross-attention mechanisms without forcibly reshaping disparate latent spaces, the Q-Former dynamically attends to synchronous audio cues (e.g., whistle blow, crowd cheer) and visual cues (e.g., player kicks, penalty cards), fusing them into an enriched, unified representation before passing the embeddings to the autoregressive decoders.
+The visual stream uses pre-extracted soccer features, while the audio stream uses CLAP-style embeddings. Each modality is encoded separately, then fused through a dual Q-Former before being passed to the Qwen2.5 language model. The resulting representation is used for event-level dense caption generation.
 
 ## Key Features
-- **Dual-Stream Integration**: Seamless parallel processing of combined visual sequence tokens and CLAP audio tokens during forward passes.
-- **Robust Audio Pipeline**: A comprehensive suite of diagnostic scripts designed to gracefully download, extract, and handle corrupted audio tracks from raw SoccerNet MKV sources.
-- **Adaptive Fallback Mechanisms**: Built-in dummy audio generation (`4_generate_dummy_audio.py`) allows inference to proceed seamlessly relying strictly on the vision stream when raw audio is irretrievably damaged.
-- **Unified Training Loop**: Multi-task learning capability supporting Dense Video Captioning, Action Spotting, and Classification through centralized batch unpacking.
+- **Dual-Stream Fusion**: parallel visual and audio processing before late fusion.
+- **Qwen2.5 Caption Decoder**: LoRA fine-tuning replaces the older GPT-2-style decoder.
+- **SoccerNet-Compatible Pipeline**: keeps the project grounded in pre-extracted feature workflows rather than pretending to run directly on raw video.
+- **Deployment Detail**: includes a minimal FastAPI inference route and Dockerfile for portable serving.
 
-## Installation
+## From GPT-2 Baseline to Current Version
+An earlier version of this line of work used a GPT-2-based caption decoder. The current version keeps the multimodal dual-stream idea, but upgrades the text generation backbone to Qwen2.5 with LoRA fine-tuning. In this public repo, GPT-2 is retained only as historical context; the main focus is the current Qwen-based system.
 
-### Prerequisites
-It is highly recommended to manage the environment utilizing `conda` or `mamba`.
+## Public Repo Boundaries
+- This repo includes the codebase, inference wrapper, and deployment scaffold.
+- This repo does **not** include model checkpoints.
+- This repo does **not** accept raw video upload as input.
+- Inference is performed from pre-extracted feature files stored outside the repository.
 
-```bash
-# Create and activate environment
-conda create -n soccernet-dvc python=3.9
-conda activate soccernet-dvc
+Checkpoints are intentionally not bundled because of file size and distribution constraints. To run real inference, set `CAPTION_CHECKPOINT_PATH` to a local checkpoint file.
 
-# Install PyTorch (Modify for your specific CUDA version)
-pip install torch torchvision torchaudio
+## Path Configuration
+This public repo is designed so users can plug in their own local paths instead of editing code. The main entry scripts now read dataset and checkpoint locations from environment variables or placeholder defaults.
 
-# Install Audio and general dependencies
-pip install librosa numpy pandas
-pip install git+https://github.com/LAION-AI/CLAP.git
+Common variables:
+- `SOCCERNET_PATH` or `SOCCERNET_VISION_ROOT`: visual feature root
+- `AUDIO_ROOT` or `SOCCERNET_AUDIO_ROOT`: audio feature root
+- `VISION_FEATURE_ROOT`: visual feature root for FastAPI serving
+- `AUDIO_FEATURE_ROOT`: audio feature root for FastAPI serving
+- `CAPTION_CHECKPOINT_PATH`: local caption checkpoint path
+- `LLM_MODEL_PATH`: Hugging Face model id or local LLM path
 
-# Install the SoccerNet core toolkit
-pip install SoccerNet
-```
-
-## Quick Start
-
-### 1. Data Preparation
-Follow the numeric order of the preparation scripts to download the dataset and extract Audio features. 
+You can start from:
 
 ```bash
-# Configure your paths as shell variables
-export SOCCERNET_VISION="./data/caption-2024/"
-export SOCCERNET_AUDIO="./data/SoccerNet"
-export SOCCERNET_ROOT=$SOCCERNET_AUDIO
-
-# 1. Download MKVs and Extract WAV files
-python 1_download_and_extract.py --quality 720p
-
-# 2. Check for damaged audio and repair
-python 3_check_wav_integrity.py 
-
-# 3. Extract CLAP Embeddings
-python 2_extract_clap_features.py 
-
-# 4. Generate padding for natively silent videos
-python 4_generate_dummy_audio.py
+cp env.example .env.local
 ```
 
-### 2. Training
-Use the top-level scripts to initiate training and inference. You can modify hyperparameters directly in the bash script.
+and then export the values you need in your shell before running training or inference scripts.
+
+## Suggested Local Layout
+The repository itself does not bundle datasets or checkpoints. A typical local setup can look like this:
+
+```text
+workspace/
+├── dual-stream-qwen-captioning/
+│   ├── deployment/api.py
+│   ├── dual_qformer.py
+│   ├── dataset_dual.py
+│   ├── run_train.sh
+│   ├── run_test.sh
+│   ├── run_audio_fix.sh
+│   └── env.example
+├── caption-2024/
+│   └── <league>/<season>/<match>/
+│       ├── 1_baidu_soccer_embeddings.npy
+│       ├── 2_baidu_soccer_embeddings.npy
+│       └── Labels-caption.json
+└── SoccerNet-audio/
+    └── <league>/<season>/<match>/
+        ├── 1_audio_clap.npy
+        ├── 2_audio_clap.npy
+        ├── 1_audio.wav
+        ├── 2_audio.wav
+        └── 1_720p.mkv / 2_720p.mkv
+```
+
+Suggested path mapping:
+- `SOCCERNET_PATH` or `SOCCERNET_VISION_ROOT` -> `caption-2024/`
+- `AUDIO_ROOT` or `SOCCERNET_AUDIO_ROOT` -> `SoccerNet-audio/`
+- `VISION_FEATURE_ROOT` -> `caption-2024/`
+- `AUDIO_FEATURE_ROOT` -> `SoccerNet-audio/`
+
+## Deployment-Oriented Detail
+This repo includes a minimal serving interface:
+- FastAPI app: `deployment/api.py`
+- Docker setup: `Dockerfile`
+- Serving dependencies: `requirements-deploy.txt`
+
+The public API exposes:
+- `GET /health`
+- `POST /predict`
+
+`POST /predict` expects:
+- `match_id`
+- `half`
+- `timestamp_seconds`
+- optional decoding controls such as `max_new_tokens`, `num_beams`, `temperature`, and `top_p`
+
+The server then:
+- resolves the relevant feature files from the configured data roots
+- extracts a centered window around the requested timestamp
+- runs the dual-stream captioning model
+- returns a caption as JSON
+
+## Running the API
+
+Install serving dependencies:
+
+```bash
+pip install -r requirements-deploy.txt
+```
+
+Set required environment variables:
+
+```bash
+export VISION_FEATURE_ROOT=/path/to/caption-2024
+export AUDIO_FEATURE_ROOT=/path/to/audio_features
+export CAPTION_CHECKPOINT_PATH=/path/to/best_metric.pth.tar
+export LLM_MODEL_PATH=Qwen/Qwen2.5-7B
+```
+
+Optional environment variables:
+
+```bash
+export VISION_FEATURE_FILE=baidu_soccer_embeddings.npy
+export FRAMERATE=1
+export WINDOW_SIZE_SECONDS=30
+```
+
+Run locally with `uvicorn`:
+
+```bash
+uvicorn deployment.api:app --host 0.0.0.0 --port 8000
+```
+
+Example request:
+
+```bash
+curl -X POST http://127.0.0.1:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "match_id": "england_epl/2016-2017/Arsenal_Chelsea",
+    "half": 1,
+    "timestamp_seconds": 2712,
+    "max_new_tokens": 32
+  }'
+```
+
+Example response:
+
+```json
+{
+  "match_id": "england_epl/2016-2017/Arsenal_Chelsea",
+  "half": 1,
+  "timestamp_seconds": 2712,
+  "caption": "A dangerous attack develops on the right side of the pitch.",
+  "device": "cuda",
+  "video_shape": [30, 1024],
+  "audio_shape": [30, 512]
+}
+```
+
+## Docker
+A lightweight `Dockerfile` is included for containerized serving:
+
+```bash
+docker build -t dual-stream-qwen-captioning .
+docker run --rm -p 8000:8000 \
+  -e VISION_FEATURE_ROOT=/data/caption-2024 \
+  -e AUDIO_FEATURE_ROOT=/data/audio_features \
+  -e CAPTION_CHECKPOINT_PATH=/weights/best_metric.pth.tar \
+  dual-stream-qwen-captioning
+```
+
+Docker is documented as a portable deployment option, but if the current server cannot run Docker, the API can still be launched directly with `uvicorn`.
+
+## Training
+The full experimental codebase still includes scripts for classification, captioning, spotting, joint training, and RL fine-tuning. For this public repo, the most direct reproducible path is inference from pre-extracted features rather than retraining from scratch.
+
 ```bash
 bash run_train.sh
 ```
 
-### 3. Inference
-To evaluate the model, run the testing script format.
-```bash
-bash run_test.sh
-```
-
 ## Acknowledgments
-This research and open-source release were heavily inspired by the pioneering work of the **SoccerNet** community and the **Deltalab** dense video captioning baseline. We thank the original authors for opening their source code, which facilitated this architectural exploration.
+This project builds on the SoccerNet dense captioning ecosystem and earlier dual-stream exploration work. Thanks to the SoccerNet organizers, the original baseline authors, and the providers of the pre-extracted feature pipelines that made this architectural exploration possible.

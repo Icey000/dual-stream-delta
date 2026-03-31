@@ -1,0 +1,670 @@
+
+[1m[96m======================================================================[0m
+[1m[96m  架构总览说明[0m
+[1m[96m======================================================================[0m
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│               双流模型架构总览 (Dual-Stream Architecture)                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────────────────────────────────────────────┐                      │
+│  │         输入 (Input Features)                    │                      │
+│  │   Video: [B, T_vid, video_input_dim=8576]        │                      │
+│  │   Audio: [B, T_aud, audio_input_dim=512]         │                      │
+│  └──────────────┬───────────────────┬───────────────┘                      │
+│                 │                   │                                       │
+│       ┌─────────▼──────┐   ┌────────▼────────┐                             │
+│       │  video_pre_proj│   │  audio_pre_proj │   ← nn.Linear               │
+│       │ Linear(8576,H) │   │  Linear(512, H) │     H = hidden_dim          │
+│       └─────────┬──────┘   └────────┬────────┘                             │
+│                 │                   │                                       │
+│    [B,T_vid,H] ─┘           └─[B,T_aud,H]                                  │
+│                                                                             │
+│       ┌──────────────┐      ┌───────────────┐                              │
+│       │ video_qformer│      │ audio_qformer │  ← QFormerVideoPooling       │
+│       │ (TransDecoder│      │ (TransDecoder │    可学习Query tokens        │
+│       │ + learnable Q│      │ + learnable Q │    cross-attend输入序列      │
+│       │  Tokens)     │      │  Tokens)      │                              │
+│       └──────┬───────┘      └───────┬───────┘                              │
+│              │                      │                                       │
+│   [B,N_v,H] ─┘                      └─ [B,N_a,H]                           │
+│         N_v=video_tokens=8               N_a=audio_tokens=8                 │
+│                                                                             │
+│       ┌──────────────────────────────────┐                                 │
+│       │      cat(dim=1) + LayerNorm      │  晚期融合 Late Fusion            │
+│       │    [B, N_v+N_a, H] = [B,16, H]  │                                 │
+│       └──────────────────┬───────────────┘                                 │
+│                          │                                                  │
+│          ┌───────────────┼──────────────────┐                              │
+│          │               │                  │                              │
+│   ┌──────▼──────┐ ┌──────▼──────┐ ┌────────▼──────┐                       │
+│   │ Classifying │ │  Spotting   │ │  Captioning   │  ← 三个下游任务        │
+│   │     Task    │ │    Task     │ │     Task      │                        │
+│   │             │ │             │ │               │                        │
+│   │  mean(dim=1)│ │  mean(dim=1)│ │  MLP(GELU)    │                       │
+│   │    [B,H]    │ │    [B,H]    │ │  [B,16,H]     │                       │
+│   │             │ │             │ │               │                        │
+│   │  Linear(H,C)│ │ MLP head    │ │  Qwen2.5-7B   │                       │
+│   │  [B, n_cls] │ │ [B, n_cls] │ │  (LoRA)       │                       │
+│   └─────────────┘ └─────────────┘ │               │                       │
+│                                   │  hidden_size= │                        │
+│                                   │    3584       │                        │
+│                                   └───────────────┘                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  ⚠️  关键问题：H (hidden_dim) 在两个阶段不同！                               │
+│                                                                             │
+│   Phase 1 Classifying: H = 768  (gpt_type="gpt2" → feature_size["gpt2"])  │
+│   Phase 2 Captioning:  H = 3584 (自动从 Qwen2.5-7B.config.hidden_size 读)  │
+│                                                                             │
+│   → video_pre_proj.weight 在checkpoint=[768,8576], 当前模型=[3584,8576]     │
+│   → 这就是 RuntimeError: size mismatch 的根本原因！                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+[1m[96m======================================================================[0m
+[1m[96m  Phase 1: DualVideo2Classification (Classifying 阶段)[0m
+[1m[96m======================================================================[0m
+      [93m→ hidden_dim = 768  (来自 gpt_type='gpt2' → feature_size['gpt2'])[0m
+      [93m→ video_input_dim = 8576[0m
+      [93m→ audio_input_dim = 512[0m
+      [93m→ video_tokens = 8, audio_tokens = 8[0m
+
+[1m[94m  ── 模型结构打印 (DualVideo2Classification)[0m
+DualVideo2Classification(
+  (encoder): DualStreamEncoder(
+    (video_pre_proj): Linear(in_features=8576, out_features=768, bias=True)
+    (video_qformer): QFormerVideoPooling(
+      (tranformer_decoder): TransformerDecoder(
+        (layers): ModuleList(
+          (0-3): 4 x TransformerDecoderLayer(
+            (self_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=768, out_features=768, bias=True)
+            )
+            (multihead_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=768, out_features=768, bias=True)
+            )
+            (linear1): Linear(in_features=768, out_features=2048, bias=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+            (linear2): Linear(in_features=2048, out_features=768, bias=True)
+            (norm1): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+            (norm2): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+            (norm3): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+            (dropout1): Dropout(p=0.1, inplace=False)
+            (dropout2): Dropout(p=0.1, inplace=False)
+            (dropout3): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+      (pos_encoder): PositionalEncoding()
+    )
+    (audio_pre_proj): Linear(in_features=512, out_features=768, bias=True)
+    (audio_qformer): QFormerVideoPooling(
+      (tranformer_decoder): TransformerDecoder(
+        (layers): ModuleList(
+          (0-3): 4 x TransformerDecoderLayer(
+            (self_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=768, out_features=768, bias=True)
+            )
+            (multihead_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=768, out_features=768, bias=True)
+            )
+            (linear1): Linear(in_features=768, out_features=2048, bias=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+            (linear2): Linear(in_features=2048, out_features=768, bias=True)
+            (norm1): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+            (norm2): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+            (norm3): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+            (dropout1): Dropout(p=0.1, inplace=False)
+            (dropout2): Dropout(p=0.1, inplace=False)
+            (dropout3): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+      (pos_encoder): PositionalEncoding()
+    )
+    (fusion_norm): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+  )
+  (fc): Linear(in_features=768, out_features=17, bias=True)
+)
+
+[1m[94m  ── 参数统计: DualVideo2Classification[0m
+    参数名                                                     Shape                             数量  可训练
+    ─────────────────────────────────────────────────────── ───────────────────────── ──────────  ────
+    encoder.video_pre_proj.weight                           (768, 8576)                6,586,368  [92m✓[0m
+    encoder.video_pre_proj.bias                             (768,)                           768  [92m✓[0m
+    encoder.video_qformer.query_tokens                      (1, 8, 768)                    6,144  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.self_attn.in_proj_weight (2304, 768)                1,769,472  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.self_attn.in_proj_bias (2304,)                        2,304  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.self_attn.out_proj.weight (768, 768)                   589,824  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.self_attn.out_proj.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.multihead_attn.in_proj_weight (2304, 768)                1,769,472  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.multihead_attn.in_proj_bias (2304,)                        2,304  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.multihead_attn.out_proj.weight (768, 768)                   589,824  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.multihead_attn.out_proj.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.linear1.weight (2048, 768)                1,572,864  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.linear1.bias (2048,)                        2,048  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.linear2.weight (768, 2048)                1,572,864  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.linear2.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.norm1.weight (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.norm1.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.norm2.weight (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.norm2.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.norm3.weight (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.0.norm3.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.self_attn.in_proj_weight (2304, 768)                1,769,472  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.self_attn.in_proj_bias (2304,)                        2,304  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.self_attn.out_proj.weight (768, 768)                   589,824  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.self_attn.out_proj.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.multihead_attn.in_proj_weight (2304, 768)                1,769,472  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.multihead_attn.in_proj_bias (2304,)                        2,304  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.multihead_attn.out_proj.weight (768, 768)                   589,824  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.multihead_attn.out_proj.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.linear1.weight (2048, 768)                1,572,864  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.linear1.bias (2048,)                        2,048  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.linear2.weight (768, 2048)                1,572,864  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.linear2.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.norm1.weight (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.norm1.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.norm2.weight (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.norm2.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.norm3.weight (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.1.norm3.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.self_attn.in_proj_weight (2304, 768)                1,769,472  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.self_attn.in_proj_bias (2304,)                        2,304  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.self_attn.out_proj.weight (768, 768)                   589,824  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.self_attn.out_proj.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.multihead_attn.in_proj_weight (2304, 768)                1,769,472  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.multihead_attn.in_proj_bias (2304,)                        2,304  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.multihead_attn.out_proj.weight (768, 768)                   589,824  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.multihead_attn.out_proj.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.linear1.weight (2048, 768)                1,572,864  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.linear1.bias (2048,)                        2,048  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.linear2.weight (768, 2048)                1,572,864  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.linear2.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.norm1.weight (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.norm1.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.norm2.weight (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.norm2.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.norm3.weight (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.2.norm3.bias (768,)                           768  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.3.self_attn.in_proj_weight (2304, 768)                1,769,472  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.3.self_attn.in_proj_bias (2304,)                        2,304  [92m✓[0m
+    encoder.video_qformer.tranformer_decoder.layers.3.self_attn.out_proj.weight (768, 768)                   589,824  [92m✓[0m
+    ... (共 154 个参数组，只显示前60个)
+
+      [92m✓ 总参数:           70,031,121[0m
+      [92m✓ 可训练参数:       70,031,121[0m
+      [92m✓ 冻结参数:                  0[0m
+
+[1m[94m  ── 假数据前向传播追踪 (B=2, T_vid=30, T_aud=30)[0m
+      [93m→ 输入 video_feats: (2, 30, 8576)[0m
+      [93m→ 输入 audio_feats: (2, 30, 512)[0m
+
+[1m[94m  ── DualVideo2Classification 维度流 (hidden=768)[0m
+    层名                                                      输入shape                             输出shape
+    ─────────────────────────────────────────────────────── ─────────────────────────────────── ─────────────────────────
+    encoder.video_pre_proj                                  (2, 30, 8576)                       (2, 30, 768)
+    encoder.video_qformer.tranformer_decoder.layers.0.self_attn [(2, 8, 768), (2, 8, 768), (2, 8, 768)] tuple
+    encoder.video_qformer.tranformer_decoder.layers.0.norm1 (2, 8, 768)                         (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.0.multihead_attn [(2, 8, 768), (2, 30, 768), (2, 30, 768)] tuple
+    encoder.video_qformer.tranformer_decoder.layers.0.norm2 (2, 8, 768)                         (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.0.linear1 (2, 8, 768)                         (2, 8, 2048)
+    encoder.video_qformer.tranformer_decoder.layers.0.linear2 (2, 8, 2048)                        (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.0.norm3 (2, 8, 768)                         (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.1.self_attn [(2, 8, 768), (2, 8, 768), (2, 8, 768)] tuple
+    encoder.video_qformer.tranformer_decoder.layers.1.norm1 (2, 8, 768)                         (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.1.multihead_attn [(2, 8, 768), (2, 30, 768), (2, 30, 768)] tuple
+    encoder.video_qformer.tranformer_decoder.layers.1.norm2 (2, 8, 768)                         (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.1.linear1 (2, 8, 768)                         (2, 8, 2048)
+    encoder.video_qformer.tranformer_decoder.layers.1.linear2 (2, 8, 2048)                        (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.1.norm3 (2, 8, 768)                         (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.2.self_attn [(2, 8, 768), (2, 8, 768), (2, 8, 768)] tuple
+    encoder.video_qformer.tranformer_decoder.layers.2.norm1 (2, 8, 768)                         (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.2.multihead_attn [(2, 8, 768), (2, 30, 768), (2, 30, 768)] tuple
+    encoder.video_qformer.tranformer_decoder.layers.2.norm2 (2, 8, 768)                         (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.2.linear1 (2, 8, 768)                         (2, 8, 2048)
+    encoder.video_qformer.tranformer_decoder.layers.2.linear2 (2, 8, 2048)                        (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.2.norm3 (2, 8, 768)                         (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.3.self_attn [(2, 8, 768), (2, 8, 768), (2, 8, 768)] tuple
+    encoder.video_qformer.tranformer_decoder.layers.3.norm1 (2, 8, 768)                         (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.3.multihead_attn [(2, 8, 768), (2, 30, 768), (2, 30, 768)] tuple
+    encoder.video_qformer.tranformer_decoder.layers.3.norm2 (2, 8, 768)                         (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.3.linear1 (2, 8, 768)                         (2, 8, 2048)
+    encoder.video_qformer.tranformer_decoder.layers.3.linear2 (2, 8, 2048)                        (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder.layers.3.norm3 (2, 8, 768)                         (2, 8, 768)
+    encoder.video_qformer.tranformer_decoder                [(2, 8, 768), (2, 30, 768)]         (2, 8, 768)
+    encoder.audio_pre_proj                                  (2, 30, 512)                        (2, 30, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.0.self_attn [(2, 8, 768), (2, 8, 768), (2, 8, 768)] tuple
+    encoder.audio_qformer.tranformer_decoder.layers.0.norm1 (2, 8, 768)                         (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.0.multihead_attn [(2, 8, 768), (2, 30, 768), (2, 30, 768)] tuple
+    encoder.audio_qformer.tranformer_decoder.layers.0.norm2 (2, 8, 768)                         (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.0.linear1 (2, 8, 768)                         (2, 8, 2048)
+    encoder.audio_qformer.tranformer_decoder.layers.0.linear2 (2, 8, 2048)                        (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.0.norm3 (2, 8, 768)                         (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.1.self_attn [(2, 8, 768), (2, 8, 768), (2, 8, 768)] tuple
+    encoder.audio_qformer.tranformer_decoder.layers.1.norm1 (2, 8, 768)                         (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.1.multihead_attn [(2, 8, 768), (2, 30, 768), (2, 30, 768)] tuple
+    encoder.audio_qformer.tranformer_decoder.layers.1.norm2 (2, 8, 768)                         (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.1.linear1 (2, 8, 768)                         (2, 8, 2048)
+    encoder.audio_qformer.tranformer_decoder.layers.1.linear2 (2, 8, 2048)                        (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.1.norm3 (2, 8, 768)                         (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.2.self_attn [(2, 8, 768), (2, 8, 768), (2, 8, 768)] tuple
+    encoder.audio_qformer.tranformer_decoder.layers.2.norm1 (2, 8, 768)                         (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.2.multihead_attn [(2, 8, 768), (2, 30, 768), (2, 30, 768)] tuple
+    encoder.audio_qformer.tranformer_decoder.layers.2.norm2 (2, 8, 768)                         (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.2.linear1 (2, 8, 768)                         (2, 8, 2048)
+    encoder.audio_qformer.tranformer_decoder.layers.2.linear2 (2, 8, 2048)                        (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.2.norm3 (2, 8, 768)                         (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.3.self_attn [(2, 8, 768), (2, 8, 768), (2, 8, 768)] tuple
+    encoder.audio_qformer.tranformer_decoder.layers.3.norm1 (2, 8, 768)                         (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.3.multihead_attn [(2, 8, 768), (2, 30, 768), (2, 30, 768)] tuple
+    encoder.audio_qformer.tranformer_decoder.layers.3.norm2 (2, 8, 768)                         (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.3.linear1 (2, 8, 768)                         (2, 8, 2048)
+    encoder.audio_qformer.tranformer_decoder.layers.3.linear2 (2, 8, 2048)                        (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder.layers.3.norm3 (2, 8, 768)                         (2, 8, 768)
+    encoder.audio_qformer.tranformer_decoder                [(2, 8, 768), (2, 30, 768)]         (2, 8, 768)
+    encoder.fusion_norm                                     (2, 16, 768)                        (2, 16, 768)
+    fc                                                      (2, 768)                            (2, 17)
+  [1m──────────────────────────────────────────────────────────────────[0m
+      [92m✓ 最终分类输出: (2, 17)  (B=2, num_classes=17)[0m
+
+[1m[94m  ── 关键维度节点 (手动标注)[0m
+
+    节点                                  张量Shape                                  说明
+    ─────────────────────────────────── ──────────────────────────────────────── ──────────────────────────────
+    video_feats 输入                      [2, 30, 8576]                            原始视觉特征
+    video_pre_proj 输出                   [2, 30, 768]                             Linear(8576→768) 降维投影
+    video_qformer 输出                    [2, 8, 768]                              Q-Former压缩：T_vid → N_v token
+    audio_feats 输入                      [2, 30, 512]                             原始音频特征
+    audio_pre_proj 输出                   [2, 30, 768]                             Linear(512→768) 投影
+    audio_qformer 输出                    [2, 8, 768]                              Q-Former压缩：T_aud → N_a token
+    cat + LayerNorm                     [2, 16, 768]                             融合: [B,8,768] + [B,8,768] → [B,16,768]
+    mean(dim=1)                         [2, 768]                                 时间池化
+    fc 输出                               [2, 17]                                  分类头 Linear(768→17)
+
+[1m[96m======================================================================[0m
+[1m[96m  Phase 2: DualVideo2CaptionLLM (Captioning 阶段)[0m
+[1m[96m======================================================================[0m
+      [93m→ hidden_dim = 3584  ← 自动从 Qwen2.5-7B.config.hidden_size 读取[0m
+      [93m→   (代码: actual_hidden = self.llm.config.hidden_size)[0m
+      [93m→ video_input_dim = 8576[0m
+      [93m→ audio_input_dim = 512[0m
+      [93m→ video_tokens = 8, audio_tokens = 8[0m
+
+[1m[94m  ── 尝试加载 DualVideo2CaptionLLM (需要 Qwen 模型文件)[0m
+trainable params: 20,185,088 || all params: 7,635,801,600 || trainable%: 0.2643
+
+[1m[94m  ── 模型结构打印 (DualVideo2CaptionLLM)[0m
+DualVideo2CaptionLLM(
+  (llm): PeftModelForCausalLM(
+    (base_model): LoraModel(
+      (model): Qwen2ForCausalLM(
+        (model): Qwen2Model(
+          (embed_tokens): Embedding(152064, 3584)
+          (layers): ModuleList(
+            (0-27): 28 x Qwen2DecoderLayer(
+              (self_attn): Qwen2Attention(
+                (q_proj): lora.Linear(
+                  (base_layer): Linear(in_features=3584, out_features=3584, bias=True)
+                  (lora_dropout): ModuleDict(
+                    (default): Dropout(p=0.05, inplace=False)
+                  )
+                  (lora_A): ModuleDict(
+                    (default): Linear(in_features=3584, out_features=8, bias=False)
+                  )
+                  (lora_B): ModuleDict(
+                    (default): Linear(in_features=8, out_features=3584, bias=False)
+                  )
+                  (lora_embedding_A): ParameterDict()
+                  (lora_embedding_B): ParameterDict()
+                  (lora_magnitude_vector): ModuleDict()
+                )
+                (k_proj): lora.Linear(
+                  (base_layer): Linear(in_features=3584, out_features=512, bias=True)
+                  (lora_dropout): ModuleDict(
+                    (default): Dropout(p=0.05, inplace=False)
+                  )
+                  (lora_A): ModuleDict(
+                    (default): Linear(in_features=3584, out_features=8, bias=False)
+                  )
+                  (lora_B): ModuleDict(
+                    (default): Linear(in_features=8, out_features=512, bias=False)
+                  )
+                  (lora_embedding_A): ParameterDict()
+                  (lora_embedding_B): ParameterDict()
+                  (lora_magnitude_vector): ModuleDict()
+                )
+                (v_proj): lora.Linear(
+                  (base_layer): Linear(in_features=3584, out_features=512, bias=True)
+                  (lora_dropout): ModuleDict(
+                    (default): Dropout(p=0.05, inplace=False)
+                  )
+                  (lora_A): ModuleDict(
+                    (default): Linear(in_features=3584, out_features=8, bias=False)
+                  )
+                  (lora_B): ModuleDict(
+                    (default): Linear(in_features=8, out_features=512, bias=False)
+                  )
+                  (lora_embedding_A): ParameterDict()
+                  (lora_embedding_B): ParameterDict()
+                  (lora_magnitude_vector): ModuleDict()
+                )
+                (o_proj): lora.Linear(
+                  (base_layer): Linear(in_features=3584, out_features=3584, bias=False)
+                  (lora_dropout): ModuleDict(
+                    (default): Dropout(p=0.05, inplace=False)
+                  )
+                  (lora_A): ModuleDict(
+                    (default): Linear(in_features=3584, out_features=8, bias=False)
+                  )
+                  (lora_B): ModuleDict(
+                    (default): Linear(in_features=8, out_features=3584, bias=False)
+                  )
+                  (lora_embedding_A): ParameterDict()
+                  (lora_embedding_B): ParameterDict()
+                  (lora_magnitude_vector): ModuleDict()
+                )
+              )
+              (mlp): Qwen2MLP(
+                (gate_proj): lora.Linear(
+                  (base_layer): Linear(in_features=3584, out_features=18944, bias=False)
+                  (lora_dropout): ModuleDict(
+                    (default): Dropout(p=0.05, inplace=False)
+                  )
+                  (lora_A): ModuleDict(
+                    (default): Linear(in_features=3584, out_features=8, bias=False)
+                  )
+                  (lora_B): ModuleDict(
+                    (default): Linear(in_features=8, out_features=18944, bias=False)
+                  )
+                  (lora_embedding_A): ParameterDict()
+                  (lora_embedding_B): ParameterDict()
+                  (lora_magnitude_vector): ModuleDict()
+                )
+                (up_proj): lora.Linear(
+                  (base_layer): Linear(in_features=3584, out_features=18944, bias=False)
+                  (lora_dropout): ModuleDict(
+                    (default): Dropout(p=0.05, inplace=False)
+                  )
+                  (lora_A): ModuleDict(
+                    (default): Linear(in_features=3584, out_features=8, bias=False)
+                  )
+                  (lora_B): ModuleDict(
+                    (default): Linear(in_features=8, out_features=18944, bias=False)
+                  )
+                  (lora_embedding_A): ParameterDict()
+                  (lora_embedding_B): ParameterDict()
+                  (lora_magnitude_vector): ModuleDict()
+                )
+                (down_proj): lora.Linear(
+                  (base_layer): Linear(in_features=18944, out_features=3584, bias=False)
+                  (lora_dropout): ModuleDict(
+                    (default): Dropout(p=0.05, inplace=False)
+                  )
+                  (lora_A): ModuleDict(
+                    (default): Linear(in_features=18944, out_features=8, bias=False)
+                  )
+                  (lora_B): ModuleDict(
+                    (default): Linear(in_features=8, out_features=3584, bias=False)
+                  )
+                  (lora_embedding_A): ParameterDict()
+                  (lora_embedding_B): ParameterDict()
+                  (lora_magnitude_vector): ModuleDict()
+                )
+                (act_fn): SiLUActivation()
+              )
+              (input_layernorm): Qwen2RMSNorm((3584,), eps=1e-06)
+              (post_attention_layernorm): Qwen2RMSNorm((3584,), eps=1e-06)
+            )
+          )
+          (norm): Qwen2RMSNorm((3584,), eps=1e-06)
+          (rotary_emb): Qwen2RotaryEmbedding()
+        )
+        (lm_head): Linear(in_features=3584, out_features=152064, bias=False)
+      )
+    )
+  )
+  (encoder): DualStreamEncoder(
+    (video_pre_proj): Linear(in_features=8576, out_features=3584, bias=True)
+    (video_qformer): QFormerVideoPooling(
+      (tranformer_decoder): TransformerDecoder(
+        (layers): ModuleList(
+          (0-3): 4 x TransformerDecoderLayer(
+            (self_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=3584, out_features=3584, bias=True)
+            )
+            (multihead_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=3584, out_features=3584, bias=True)
+            )
+            (linear1): Linear(in_features=3584, out_features=2048, bias=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+            (linear2): Linear(in_features=2048, out_features=3584, bias=True)
+            (norm1): LayerNorm((3584,), eps=1e-05, elementwise_affine=True)
+            (norm2): LayerNorm((3584,), eps=1e-05, elementwise_affine=True)
+            (norm3): LayerNorm((3584,), eps=1e-05, elementwise_affine=True)
+            (dropout1): Dropout(p=0.1, inplace=False)
+            (dropout2): Dropout(p=0.1, inplace=False)
+            (dropout3): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+      (pos_encoder): PositionalEncoding()
+    )
+    (audio_pre_proj): Linear(in_features=512, out_features=3584, bias=True)
+    (audio_qformer): QFormerVideoPooling(
+      (tranformer_decoder): TransformerDecoder(
+        (layers): ModuleList(
+          (0-3): 4 x TransformerDecoderLayer(
+            (self_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=3584, out_features=3584, bias=True)
+            )
+            (multihead_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=3584, out_features=3584, bias=True)
+            )
+            (linear1): Linear(in_features=3584, out_features=2048, bias=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+            (linear2): Linear(in_features=2048, out_features=3584, bias=True)
+            (norm1): LayerNorm((3584,), eps=1e-05, elementwise_affine=True)
+            (norm2): LayerNorm((3584,), eps=1e-05, elementwise_affine=True)
+            (norm3): LayerNorm((3584,), eps=1e-05, elementwise_affine=True)
+            (dropout1): Dropout(p=0.1, inplace=False)
+            (dropout2): Dropout(p=0.1, inplace=False)
+            (dropout3): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+      (pos_encoder): PositionalEncoding()
+    )
+    (fusion_norm): LayerNorm((3584,), eps=1e-05, elementwise_affine=True)
+  )
+  (proj): Sequential(
+    (0): Linear(in_features=3584, out_features=14336, bias=True)
+    (1): GELU(approximate='none')
+    (2): Linear(in_features=14336, out_features=3584, bias=True)
+  )
+)
+
+[1m[94m  ── 参数统计: DualVideo2CaptionLLM[0m
+    参数名                                                     Shape                             数量  可训练
+    ─────────────────────────────────────────────────────── ───────────────────────── ──────────  ────
+    llm.base_model.model.model.embed_tokens.weight          (152064, 3584)            544,997,376  [91m✗[0m
+    llm.base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight (3584, 3584)              12,845,056  [91m✗[0m
+    llm.base_model.model.model.layers.0.self_attn.q_proj.base_layer.bias (3584,)                        3,584  [91m✗[0m
+    llm.base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.0.self_attn.q_proj.lora_B.default.weight (3584, 8)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.0.self_attn.k_proj.base_layer.weight (512, 3584)                1,835,008  [91m✗[0m
+    llm.base_model.model.model.layers.0.self_attn.k_proj.base_layer.bias (512,)                           512  [91m✗[0m
+    llm.base_model.model.model.layers.0.self_attn.k_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.0.self_attn.k_proj.lora_B.default.weight (512, 8)                       4,096  [92m✓[0m
+    llm.base_model.model.model.layers.0.self_attn.v_proj.base_layer.weight (512, 3584)                1,835,008  [91m✗[0m
+    llm.base_model.model.model.layers.0.self_attn.v_proj.base_layer.bias (512,)                           512  [91m✗[0m
+    llm.base_model.model.model.layers.0.self_attn.v_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.0.self_attn.v_proj.lora_B.default.weight (512, 8)                       4,096  [92m✓[0m
+    llm.base_model.model.model.layers.0.self_attn.o_proj.base_layer.weight (3584, 3584)              12,845,056  [91m✗[0m
+    llm.base_model.model.model.layers.0.self_attn.o_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.0.self_attn.o_proj.lora_B.default.weight (3584, 8)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.0.mlp.gate_proj.base_layer.weight (18944, 3584)             67,895,296  [91m✗[0m
+    llm.base_model.model.model.layers.0.mlp.gate_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.0.mlp.gate_proj.lora_B.default.weight (18944, 8)                   151,552  [92m✓[0m
+    llm.base_model.model.model.layers.0.mlp.up_proj.base_layer.weight (18944, 3584)             67,895,296  [91m✗[0m
+    llm.base_model.model.model.layers.0.mlp.up_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.0.mlp.up_proj.lora_B.default.weight (18944, 8)                   151,552  [92m✓[0m
+    llm.base_model.model.model.layers.0.mlp.down_proj.base_layer.weight (3584, 18944)             67,895,296  [91m✗[0m
+    llm.base_model.model.model.layers.0.mlp.down_proj.lora_A.default.weight (8, 18944)                   151,552  [92m✓[0m
+    llm.base_model.model.model.layers.0.mlp.down_proj.lora_B.default.weight (3584, 8)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.0.input_layernorm.weight (3584,)                        3,584  [91m✗[0m
+    llm.base_model.model.model.layers.0.post_attention_layernorm.weight (3584,)                        3,584  [91m✗[0m
+    llm.base_model.model.model.layers.1.self_attn.q_proj.base_layer.weight (3584, 3584)              12,845,056  [91m✗[0m
+    llm.base_model.model.model.layers.1.self_attn.q_proj.base_layer.bias (3584,)                        3,584  [91m✗[0m
+    llm.base_model.model.model.layers.1.self_attn.q_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.1.self_attn.q_proj.lora_B.default.weight (3584, 8)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.1.self_attn.k_proj.base_layer.weight (512, 3584)                1,835,008  [91m✗[0m
+    llm.base_model.model.model.layers.1.self_attn.k_proj.base_layer.bias (512,)                           512  [91m✗[0m
+    llm.base_model.model.model.layers.1.self_attn.k_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.1.self_attn.k_proj.lora_B.default.weight (512, 8)                       4,096  [92m✓[0m
+    llm.base_model.model.model.layers.1.self_attn.v_proj.base_layer.weight (512, 3584)                1,835,008  [91m✗[0m
+    llm.base_model.model.model.layers.1.self_attn.v_proj.base_layer.bias (512,)                           512  [91m✗[0m
+    llm.base_model.model.model.layers.1.self_attn.v_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.1.self_attn.v_proj.lora_B.default.weight (512, 8)                       4,096  [92m✓[0m
+    llm.base_model.model.model.layers.1.self_attn.o_proj.base_layer.weight (3584, 3584)              12,845,056  [91m✗[0m
+    llm.base_model.model.model.layers.1.self_attn.o_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.1.self_attn.o_proj.lora_B.default.weight (3584, 8)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.1.mlp.gate_proj.base_layer.weight (18944, 3584)             67,895,296  [91m✗[0m
+    llm.base_model.model.model.layers.1.mlp.gate_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.1.mlp.gate_proj.lora_B.default.weight (18944, 8)                   151,552  [92m✓[0m
+    llm.base_model.model.model.layers.1.mlp.up_proj.base_layer.weight (18944, 3584)             67,895,296  [91m✗[0m
+    llm.base_model.model.model.layers.1.mlp.up_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.1.mlp.up_proj.lora_B.default.weight (18944, 8)                   151,552  [92m✓[0m
+    llm.base_model.model.model.layers.1.mlp.down_proj.base_layer.weight (3584, 18944)             67,895,296  [91m✗[0m
+    llm.base_model.model.model.layers.1.mlp.down_proj.lora_A.default.weight (8, 18944)                   151,552  [92m✓[0m
+    llm.base_model.model.model.layers.1.mlp.down_proj.lora_B.default.weight (3584, 8)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.1.input_layernorm.weight (3584,)                        3,584  [91m✗[0m
+    llm.base_model.model.model.layers.1.post_attention_layernorm.weight (3584,)                        3,584  [91m✗[0m
+    llm.base_model.model.model.layers.2.self_attn.q_proj.base_layer.weight (3584, 3584)              12,845,056  [91m✗[0m
+    llm.base_model.model.model.layers.2.self_attn.q_proj.base_layer.bias (3584,)                        3,584  [91m✗[0m
+    llm.base_model.model.model.layers.2.self_attn.q_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.2.self_attn.q_proj.lora_B.default.weight (3584, 8)                     28,672  [92m✓[0m
+    llm.base_model.model.model.layers.2.self_attn.k_proj.base_layer.weight (512, 3584)                1,835,008  [91m✗[0m
+    llm.base_model.model.model.layers.2.self_attn.k_proj.base_layer.bias (512,)                           512  [91m✗[0m
+    llm.base_model.model.model.layers.2.self_attn.k_proj.lora_A.default.weight (8, 3584)                     28,672  [92m✓[0m
+    ... (共 887 个参数组，只显示前60个)
+
+      [92m✓ 总参数:        8,711,193,600[0m
+      [92m✓ 可训练参数:    1,095,577,088[0m
+      [92m✓ 冻结参数:      7,615,616,512[0m
+
+[1m[94m  ── Encoder 维度流 (hidden=3584)[0m
+    层名                                                      输入shape                             输出shape
+    ─────────────────────────────────────────────────────── ─────────────────────────────────── ─────────────────────────
+    video_pre_proj                                          (2, 30, 8576)                       (2, 30, 3584)
+    video_qformer.tranformer_decoder.layers.0.self_attn     [(2, 8, 3584), (2, 8, 3584), (2, 8, 3584)] tuple
+    video_qformer.tranformer_decoder.layers.0.norm1         (2, 8, 3584)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.0.multihead_attn [(2, 8, 3584), (2, 30, 3584), (2, 30, 3584)] tuple
+    video_qformer.tranformer_decoder.layers.0.norm2         (2, 8, 3584)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.0.linear1       (2, 8, 3584)                        (2, 8, 2048)
+    video_qformer.tranformer_decoder.layers.0.linear2       (2, 8, 2048)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.0.norm3         (2, 8, 3584)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.1.self_attn     [(2, 8, 3584), (2, 8, 3584), (2, 8, 3584)] tuple
+    video_qformer.tranformer_decoder.layers.1.norm1         (2, 8, 3584)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.1.multihead_attn [(2, 8, 3584), (2, 30, 3584), (2, 30, 3584)] tuple
+    video_qformer.tranformer_decoder.layers.1.norm2         (2, 8, 3584)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.1.linear1       (2, 8, 3584)                        (2, 8, 2048)
+    video_qformer.tranformer_decoder.layers.1.linear2       (2, 8, 2048)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.1.norm3         (2, 8, 3584)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.2.self_attn     [(2, 8, 3584), (2, 8, 3584), (2, 8, 3584)] tuple
+    video_qformer.tranformer_decoder.layers.2.norm1         (2, 8, 3584)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.2.multihead_attn [(2, 8, 3584), (2, 30, 3584), (2, 30, 3584)] tuple
+    video_qformer.tranformer_decoder.layers.2.norm2         (2, 8, 3584)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.2.linear1       (2, 8, 3584)                        (2, 8, 2048)
+    video_qformer.tranformer_decoder.layers.2.linear2       (2, 8, 2048)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.2.norm3         (2, 8, 3584)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.3.self_attn     [(2, 8, 3584), (2, 8, 3584), (2, 8, 3584)] tuple
+    video_qformer.tranformer_decoder.layers.3.norm1         (2, 8, 3584)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.3.multihead_attn [(2, 8, 3584), (2, 30, 3584), (2, 30, 3584)] tuple
+    video_qformer.tranformer_decoder.layers.3.norm2         (2, 8, 3584)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.3.linear1       (2, 8, 3584)                        (2, 8, 2048)
+    video_qformer.tranformer_decoder.layers.3.linear2       (2, 8, 2048)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder.layers.3.norm3         (2, 8, 3584)                        (2, 8, 3584)
+    video_qformer.tranformer_decoder                        [(2, 8, 3584), (2, 30, 3584)]       (2, 8, 3584)
+    audio_pre_proj                                          (2, 30, 512)                        (2, 30, 3584)
+    audio_qformer.tranformer_decoder.layers.0.self_attn     [(2, 8, 3584), (2, 8, 3584), (2, 8, 3584)] tuple
+    audio_qformer.tranformer_decoder.layers.0.norm1         (2, 8, 3584)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.0.multihead_attn [(2, 8, 3584), (2, 30, 3584), (2, 30, 3584)] tuple
+    audio_qformer.tranformer_decoder.layers.0.norm2         (2, 8, 3584)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.0.linear1       (2, 8, 3584)                        (2, 8, 2048)
+    audio_qformer.tranformer_decoder.layers.0.linear2       (2, 8, 2048)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.0.norm3         (2, 8, 3584)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.1.self_attn     [(2, 8, 3584), (2, 8, 3584), (2, 8, 3584)] tuple
+    audio_qformer.tranformer_decoder.layers.1.norm1         (2, 8, 3584)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.1.multihead_attn [(2, 8, 3584), (2, 30, 3584), (2, 30, 3584)] tuple
+    audio_qformer.tranformer_decoder.layers.1.norm2         (2, 8, 3584)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.1.linear1       (2, 8, 3584)                        (2, 8, 2048)
+    audio_qformer.tranformer_decoder.layers.1.linear2       (2, 8, 2048)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.1.norm3         (2, 8, 3584)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.2.self_attn     [(2, 8, 3584), (2, 8, 3584), (2, 8, 3584)] tuple
+    audio_qformer.tranformer_decoder.layers.2.norm1         (2, 8, 3584)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.2.multihead_attn [(2, 8, 3584), (2, 30, 3584), (2, 30, 3584)] tuple
+    audio_qformer.tranformer_decoder.layers.2.norm2         (2, 8, 3584)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.2.linear1       (2, 8, 3584)                        (2, 8, 2048)
+    audio_qformer.tranformer_decoder.layers.2.linear2       (2, 8, 2048)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.2.norm3         (2, 8, 3584)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.3.self_attn     [(2, 8, 3584), (2, 8, 3584), (2, 8, 3584)] tuple
+    audio_qformer.tranformer_decoder.layers.3.norm1         (2, 8, 3584)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.3.multihead_attn [(2, 8, 3584), (2, 30, 3584), (2, 30, 3584)] tuple
+    audio_qformer.tranformer_decoder.layers.3.norm2         (2, 8, 3584)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.3.linear1       (2, 8, 3584)                        (2, 8, 2048)
+    audio_qformer.tranformer_decoder.layers.3.linear2       (2, 8, 2048)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder.layers.3.norm3         (2, 8, 3584)                        (2, 8, 3584)
+    audio_qformer.tranformer_decoder                        [(2, 8, 3584), (2, 30, 3584)]       (2, 8, 3584)
+    fusion_norm                                             (2, 16, 3584)                       (2, 16, 3584)
+  [1m──────────────────────────────────────────────────────────────────[0m
+      [92m✓ Encoder 输出: (2, 16, 3584)[0m
+      [92m✓ MLP proj 输出: (2, 16, 3584)  → 喂入Qwen作为visual prefix tokens[0m
+
+[1m[94m  ── 关键维度节点 (手动标注, Captioning阶段)[0m
+
+    节点                                    张量Shape                        说明
+    ───────────────────────────────────── ────────────────────────────── ───────────────────────────────────
+    video_feats 输入                        [B, T_vid, 8576]               原始视觉特征
+    video_pre_proj 输出                     [B, T_vid, 3584]               Linear(8576→3584) ← 不同于Phase1!
+    video_qformer 输出                      [B, 8, 3584]                   Q-Former压缩
+    audio_feats 输入                        [B, T_aud, 512]                原始音频特征
+    audio_pre_proj 输出                     [B, T_aud, 3584]               Linear(512→3584)
+    audio_qformer 输出                      [B, 8, 3584]                   Q-Former压缩
+    cat + LayerNorm                       [B, 16, 3584]                  融合: [B,8,3584]+[B,8,3584]→[B,16,3584]
+    MLP proj 中间                           [B, 16, 14336]                 ×4 expand (GELU)
+    MLP proj 输出                           [B, 16, 3584]                  visual prefix tokens for Qwen
+    Qwen2.5-7B 输入                         [B, T_text+16, 3584]           visual tokens拼接文本embeddings
+    Qwen2.5-7B 输出                         [B, T_text+16, vocab]          最终Caption预测
+
+[1m[96m======================================================================[0m
+[1m[96m  ⚠️  维度不匹配：根本原因分析[0m
+[1m[96m======================================================================[0m
+
+  [1m问题根源:[0m
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                                                                  │
+  │  classifying.py 第67行:                                         │
+  │    hidden_dim = feature_size[args.gpt_type]                     │
+  │                            ↓                                    │
+  │    feature_size = {"gpt2": 768, ...}  → hidden_dim = [93m768[0m        │
+  │                                                                  │
+  │  dual_qformer.py 第365行 (DualVideo2CaptionLLM):                │
+  │    actual_hidden = self.llm.config.hidden_size                  │
+  │                            ↓                                    │
+  │    Qwen2.5-7B.hidden_size = [91m3584[0m  → hidden_dim = [91m3584[0m        │
+  │                                                                  │
+  │  所以:                                                           │
+  │    checkpoint 保存的是: video_pre_proj.weight [[93m768[0m, 8576]      │
+  │    当前模型期望的是:    video_pre_proj.weight [[91m3584[0m, 8576]     │
+  │                                                                  │
+  │  [1m修复方案:[0m                                                      │
+  │    在 classifying.py 第67行，将 hidden_dim 改为 [92m3584[0m:            │
+  │                                                                  │
+  │    [92mhidden_dim = 3584  # 与 Qwen2.5-7B hidden_size 一致[0m          │
+  │                                                                  │
+  │    然后重新训练 classifying 阶段，保存的 encoder 权重维度        │
+  │    就能正确匹配 captioning 阶段了。                              │
+  │                                                                  │
+  └──────────────────────────────────────────────────────────────────┘
+

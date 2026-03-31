@@ -43,8 +43,8 @@ import argparse
 import numpy as np
 
 # ================= 配置区 =================
-VISION_ROOT  = os.environ.get("SOCCERNET_VISION", "./data/caption-2024/")
-AUDIO_ROOT   = os.environ.get("SOCCERNET_AUDIO", "./data/SoccerNet/")
+VISION_ROOT  = os.getenv("SOCCERNET_VISION_ROOT", "/path/to/caption-2024")
+AUDIO_ROOT   = os.getenv("SOCCERNET_AUDIO_ROOT", "/path/to/SoccerNet-audio")
 VISION_FEAT  = "baidu_soccer_embeddings.npy"
 AUDIO_DIM    = 512    # LAION-CLAP 输出维度，与 args.audio_input_dim 一致
 SPLITS       = ["train", "valid", "test"]

@@ -16,8 +16,8 @@ import time
 # ──────────────────────────────────────────────
 # 路径配置（与 run_train.sh 保持一致）
 # ──────────────────────────────────────────────
-VISION_ROOT = os.environ.get("SOCCERNET_VISION", "./data/caption-2024/")
-AUDIO_ROOT  = os.environ.get("SOCCERNET_AUDIO", "./data/SoccerNet/")
+VISION_ROOT = os.getenv("SOCCERNET_VISION_ROOT", "/path/to/caption-2024")
+AUDIO_ROOT  = os.getenv("SOCCERNET_AUDIO_ROOT", "/path/to/SoccerNet-audio")
 VISION_FEAT = "baidu_soccer_embeddings.npy"
 LABEL_FILE  = "Labels-caption.json"
 OUTPUT_TXT  = "missing_audio_games.txt"

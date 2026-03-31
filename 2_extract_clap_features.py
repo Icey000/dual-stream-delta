@@ -8,13 +8,15 @@ import time
 from SoccerNet.Downloader import getListGames
 
 # ================= 配置区 =================
-ROOT_DIR   = os.environ.get("SOCCERNET_ROOT", "./data/SoccerNet")
+ROOT_DIR   = os.getenv("SOCCERNET_AUDIO_ROOT", "/path/to/SoccerNet-audio")
 SPLITS     = ["train", "valid", "test"]
 WINDOW_SEC = 2.0    # 每 2 秒切一刀提取一个特征 token
 BATCH_SIZE = 32     # 显卡每次吞吐的音频块数
 # ==========================================
 
 parser = argparse.ArgumentParser()
+parser.add_argument("--root_dir", type=str, default=ROOT_DIR,
+                    help="SoccerNet audio root containing WAV and CLAP features")
 parser.add_argument("--from_txt", type=str, default=None,
                     help="只对此 txt 文件内的比赛提取 CLAP 特征，"
                          "通常是 missing_audio_games.txt 或 broken_wav_games.txt")
@@ -110,9 +112,11 @@ def extract_clap_from_wav(model, wav_path, npy_path):
 #  主逻辑
 # ══════════════════════════════════════════════════════
 
+root_dir = args.root_dir.rstrip("/")
+
 print(f"\n{'='*65}")
 print(f"  STEP 2: 提取 LAION-CLAP 音频特征")
-print(f"  ROOT_DIR   : {ROOT_DIR}")
+print(f"  ROOT_DIR   : {root_dir}")
 print(f"  WINDOW_SEC : {WINDOW_SEC}s  |  BATCH_SIZE: {BATCH_SIZE}")
 print(f"{'='*65}\n")
 
@@ -152,7 +156,7 @@ print(f"{'─'*65}")
 
 for i, (game, split_label) in enumerate(games_with_split):
     print(f"\n[{i+1}/{total}] {game}  [{split_label}]")
-    game_path = os.path.join(ROOT_DIR, game)
+    game_path = os.path.join(root_dir, game)
 
     for half in [1, 2]:
         wav_path = os.path.join(game_path, f"{half}_audio.wav")
