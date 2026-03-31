@@ -182,5 +182,57 @@ The full experimental codebase still includes scripts for classification, captio
 bash run_train.sh
 ```
 
+## [Optional] Caption Visualization
+
+You can render a short video clip with the model-generated captions overlaid at their predicted timestamps. Ground-truth labels are intentionally **not** shown — only the model's own captions appear.
+
+### Step 1 — Install extra dependencies
+
+```bash
+pip install opencv-python pillow SoccerNet
+```
+
+### Step 2 — (First time) Download the match video
+
+SoccerNet requires a registered account and a download password.
+
+```bash
+python visualize_captions.py \
+  --download_only \
+  --match_id   "england_epl/2016-2017/2017-05-06 - 17-00 Leicester 3 - 0 Watford" \
+  --video_dir  /path/to/save/match_folder \
+  --soccernet_password YOUR_PASSWORD
+```
+
+This downloads the 224p `.mkv` files for both halves (small file size, good for demos).
+
+### Step 3 — Render a captioned clip
+
+```bash
+python visualize_captions.py \
+  --pred_json  /path/to/results_dense_captioning.json \
+  --video_dir  /path/to/match_folder \
+  --half       1 \
+  --start_min  30 \
+  --end_min    35 \
+  --output     caption_demo.mp4
+```
+
+| Argument | Description |
+|---|---|
+| `--pred_json` | JSON file produced by DVC inference (e.g. `models/<name>/outputs/test/.../results_dense_captioning.json`) |
+| `--video_dir` | Folder containing the half video (`1_224p.mkv` / `2_224p.mkv`) |
+| `--half` | 1 or 2 |
+| `--start_min` / `--end_min` | Clip window in minutes |
+| `--output` | Output `.mp4` path |
+
+The script adds a compact black bar below the video frame and places the caption text there, centered and auto-wrapped. The bar height is kept proportional to the video so the caption is readable without covering the match footage.
+
+## License
+This repository is licensed under the MIT License; see the [LICENSE](LICENSE) file for details. The MIT license applies to the code in this repository only. External datasets and model weights, including SoccerNet and Qwen2.5, remain subject to their respective original licenses and usage terms.
+
 ## Acknowledgments
-This project builds on the SoccerNet dense captioning ecosystem and earlier dual-stream exploration work. Thanks to the SoccerNet organizers, the original baseline authors, and the providers of the pre-extracted feature pipelines that made this architectural exploration possible.
+- Codebase direction was initially inspired by and extended from the SoccerNet dense captioning ecosystem, including the [sn-caption](https://github.com/SoccerNet/sn-caption) baseline.
+- The Qwen2.5 language model backbone builds on the work of the [Qwen Team](https://github.com/QwenLM/Qwen2.5).
+- We thank the SoccerNet team for organizing the challenge and providing the datasets, and the Baidu team for the pre-extracted visual features.
+
